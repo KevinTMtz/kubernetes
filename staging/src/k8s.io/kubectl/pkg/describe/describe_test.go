@@ -290,8 +290,8 @@ func TestDescribePodVolumes(t *testing.T) {
 				Node:         <none>
 				Labels:       <none>
 				Annotations:  <none>
-				Status:       
-				IP:           
+				Status:
+				IP:
 				IPs:          <none>
 				Containers: <none>
 				Volumes:
@@ -3389,13 +3389,13 @@ func TestDescribeIngress(t *testing.T) {
 Labels:           id1=app1
                   id2=app2
 Namespace:        foo
-Address:          
+Address:
 Ingress Class:    test
 Default backend:  <default>
 Rules:
   Host         Path  Backends
   ----         ----  --------
-  foo.bar.com  
+  foo.bar.com
                /foo   default-backend:80 (<error: services "default-backend" not found>)
 Annotations:   <none>
 Events:        <none>` + "\n",
@@ -3405,13 +3405,13 @@ Events:        <none>` + "\n",
 			output: `Name:             bar
 Labels:           <none>
 Namespace:        foo
-Address:          
+Address:
 Ingress Class:    test
 Default backend:  <default>
 Rules:
   Host         Path  Backends
   ----         ----  --------
-  foo.bar.com  
+  foo.bar.com
                /foo   default-backend:80 (<error: services "default-backend" not found>)
 Annotations:   <none>
 Events:        <none>` + "\n",
@@ -3444,13 +3444,13 @@ Events:        <none>` + "\n",
 			output: `Name:             bar
 Labels:           <none>
 Namespace:        foo
-Address:          
+Address:
 Ingress Class:    test
 Default backend:  <default>
 Rules:
   Host         Path  Backends
   ----         ----  --------
-  foo.bar.com  
+  foo.bar.com
                /foo   APIGroup: example.com, Kind: foo, Name: bar
 Annotations:   <none>
 Events:        <none>` + "\n",
@@ -3483,13 +3483,13 @@ Events:        <none>` + "\n",
 			output: `Name:             bar
 Labels:           <none>
 Namespace:        foo
-Address:          
+Address:
 Ingress Class:    test
 Default backend:  <default>
 Rules:
   Host         Path  Backends
   ----         ----  --------
-  foo.bar.com  
+  foo.bar.com
                /foo   APIGroup: <none>, Kind: foo, Name: bar
 Annotations:   <none>
 Events:        <none>` + "\n",
@@ -3523,13 +3523,13 @@ Events:        <none>` + "\n",
 			output: `Name:             bar
 Labels:           <none>
 Namespace:        foo
-Address:          
+Address:
 Ingress Class:    test
 Default backend:  default-backend:80 (<error: services "default-backend" not found>)
 Rules:
   Host         Path  Backends
   ----         ----  --------
-  foo.bar.com  
+  foo.bar.com
                /foo   default-backend:80 (<error: services "default-backend" not found>)
 Annotations:   <none>
 Events:        <none>` + "\n",
@@ -3563,13 +3563,13 @@ Events:        <none>` + "\n",
 			output: `Name:             bar
 Labels:           <none>
 Namespace:        foo
-Address:          
+Address:
 Ingress Class:    test
 Default backend:  APIGroup: example.com, Kind: foo, Name: bar
 Rules:
   Host         Path  Backends
   ----         ----  --------
-  foo.bar.com  
+  foo.bar.com
                /foo   APIGroup: example.com, Kind: foo, Name: bar
 Annotations:   <none>
 Events:        <none>` + "\n",
@@ -3603,13 +3603,13 @@ Events:        <none>` + "\n",
 			output: `Name:             bar
 Labels:           <none>
 Namespace:        foo
-Address:          
+Address:
 Ingress Class:    test
 Default backend:  APIGroup: example.com, Kind: foo, Name: bar
 Rules:
   Host         Path  Backends
   ----         ----  --------
-  foo.bar.com  
+  foo.bar.com
                /foo   default-backend:80 (<error: services "default-backend" not found>)
 Annotations:   <none>
 Events:        <none>` + "\n",
@@ -3628,7 +3628,7 @@ Events:        <none>` + "\n",
 			output: `Name:             bar
 Labels:           <none>
 Namespace:        foo
-Address:          
+Address:
 Ingress Class:    test
 Default backend:  default-backend:80 (<error: services "default-backend" not found>)
 Rules:
@@ -3652,7 +3652,7 @@ Events:       <none>
 			output: `Name:             bar
 Labels:           <none>
 Namespace:        foo
-Address:          
+Address:
 Ingress Class:    test
 Default backend:  <default>
 Rules:
@@ -3676,7 +3676,7 @@ Events:       <none>
 			output: `Name:             bar
 Labels:           <none>
 Namespace:        foo
-Address:          
+Address:
 Ingress Class:    <none>
 Default backend:  default-backend:80 (<error: services "default-backend" not found>)
 Rules:
