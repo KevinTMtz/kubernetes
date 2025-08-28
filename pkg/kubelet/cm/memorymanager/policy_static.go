@@ -108,8 +108,101 @@ func (p *staticPolicy) Allocate(ctx context.Context, s state.State, pod *v1.Pod,
 		return nil
 	}
 
+	if utilfeature.DefaultFeatureGate.Enabled(features.PodLevelResourceManagers) && utilfeature.DefaultFeatureGate.Enabled(features.PodLevelResources) && resourcehelper.IsPodLevelResourcesSet(pod) {
+		// Check if memory is already allocated for this pod
+		assignments := s.GetMemoryAssignments()
+		if podAssignments, ok := assignments[string(pod.UID)]; ok {
+			if len(podAssignments) > 0 {
+				// Get the memory blocks from the first container in the pod
+				var blocks []state.Block
+				for _, b := range podAssignments {
+					blocks = b
+					break
+				}
+				logger.Info("Static policy: Pod already has memory allocated, assigning same memory blocks to container", "pod", klog.KObj(pod), "containerName", container.Name)
+				s.SetMemoryBlocks(string(pod.UID), container.Name, blocks)
+				return nil
+			}
+		}
+
+		// This is the first container for this pod. Allocate for the whole pod.
+		requestedResources, err := getPodRequestedResources(pod)
+		if err != nil {
+			return err
+		}
+		if len(requestedResources) == 0 {
+			return nil
+		}
+
+		logger.Info("Static policy: Allocate pod-level memory", "pod", klog.KObj(pod), "requests", requestedResources)
+		metrics.MemoryManagerPinningRequestTotal.Inc()
+		defer func() {
+			if rerr != nil {
+				metrics.MemoryManagerPinningErrorsTotal.Inc()
+			}
+		}()
+
+		hint := p.affinity.GetAffinity(string(pod.UID), container.Name)
+		logger.Info("Got topology affinity for pod", "hint", hint)
+
+		machineState := s.GetMachineState()
+		bestHint := &hint
+		if hint.NUMANodeAffinity == nil {
+			defaultHint, err := p.getDefaultHint(machineState, pod, requestedResources)
+			if err != nil {
+				return err
+			}
+			if !defaultHint.Preferred && bestHint.Preferred {
+				return fmt.Errorf("[memorymanager] failed to find the default preferred hint")
+			}
+			bestHint = defaultHint
+		}
+
+		if !isAffinitySatisfyRequest(machineState, bestHint.NUMANodeAffinity, requestedResources) {
+			extendedHint, err := p.extendTopologyManagerHint(machineState, pod, requestedResources, bestHint.NUMANodeAffinity)
+			if err != nil {
+				return err
+			}
+			if !extendedHint.Preferred && bestHint.Preferred {
+				return fmt.Errorf("[memorymanager] failed to find the extended preferred hint")
+			}
+			bestHint = extendedHint
+		}
+
+		if isAffinityViolatingNUMAAllocations(machineState, bestHint.NUMANodeAffinity) {
+			return fmt.Errorf("[memorymanager] preferred hint violates NUMA node allocation")
+		}
+
+		var containerBlocks []state.Block
+		maskBits := bestHint.NUMANodeAffinity.GetBits()
+		for resourceName, requestedSize := range requestedResources {
+			containerBlocks = append(containerBlocks, state.Block{
+				NUMAAffinity: maskBits,
+				Size:         requestedSize,
+				Type:         resourceName,
+			})
+
+			podReusableMemory := p.getPodReusableMemory(pod, bestHint.NUMANodeAffinity, resourceName)
+			if podReusableMemory >= requestedSize {
+				requestedSize = 0
+			} else {
+				requestedSize -= podReusableMemory
+			}
+
+			p.updateMachineState(machineState, maskBits, resourceName, requestedSize)
+		}
+
+		p.updatePodReusableMemory(pod, container, containerBlocks)
+		s.SetMachineState(machineState)
+		s.SetMemoryBlocks(string(pod.UID), container.Name, containerBlocks)
+		p.updateInitContainersMemoryBlocks(logger, s, pod, container, containerBlocks)
+
+		logger.V(4).Info("Allocated exclusive memory for pod")
+		return nil
+	}
+
 	podUID := string(pod.UID)
-	if utilfeature.DefaultFeatureGate.Enabled(features.PodLevelResources) && resourcehelper.IsPodLevelResourcesSet(pod) {
+	if !utilfeature.DefaultFeatureGate.Enabled(features.PodLevelResourceManagers) && utilfeature.DefaultFeatureGate.Enabled(features.PodLevelResources) && resourcehelper.IsPodLevelResourcesSet(pod) {
 		logger.V(2).Info("Allocation skipped, pod is using pod-level resources which are not supported by the static Memory manager policy", "podUID", podUID)
 		return nil
 	}
@@ -351,6 +444,19 @@ func regenerateHints(logger logr.Logger, pod *v1.Pod, ctn *v1.Container, ctnBloc
 }
 
 func getPodRequestedResources(pod *v1.Pod) (map[v1.ResourceName]uint64, error) {
+	if utilfeature.DefaultFeatureGate.Enabled(features.PodLevelResourceManagers) && utilfeature.DefaultFeatureGate.Enabled(features.PodLevelResources) && resourcehelper.IsPodLevelResourcesSet(pod) {
+		req := make(map[v1.ResourceName]uint64)
+		for rName, rQuant := range pod.Spec.Resources.Requests {
+			if rName == v1.ResourceMemory || corehelper.IsHugePageResourceName(rName) {
+				val, ok := rQuant.AsInt64()
+				if !ok {
+					return nil, fmt.Errorf("failed to convert resource quantity to int64")
+				}
+				req[rName] = uint64(val)
+			}
+		}
+		return req, nil
+	}
 	// Maximun resources requested by init containers at any given time.
 	reqRsrcsByInitCtrs := make(map[v1.ResourceName]uint64)
 	// Total resources requested by restartable init containers.
@@ -418,7 +524,7 @@ func (p *staticPolicy) GetPodTopologyHints(ctx context.Context, s state.State, p
 		return nil
 	}
 
-	if utilfeature.DefaultFeatureGate.Enabled(features.PodLevelResources) && resourcehelper.IsPodLevelResourcesSet(pod) {
+	if !utilfeature.DefaultFeatureGate.Enabled(features.PodLevelResourceManagers) && utilfeature.DefaultFeatureGate.Enabled(features.PodLevelResources) && resourcehelper.IsPodLevelResourcesSet(pod) {
 		logger.V(3).Info("Topology hints generation skipped, pod is using pod-level resources which are not supported by the static Memory manager policy", "podUID", pod.UID)
 		return nil
 	}
@@ -453,7 +559,7 @@ func (p *staticPolicy) GetTopologyHints(ctx context.Context, s state.State, pod 
 		return nil
 	}
 
-	if utilfeature.DefaultFeatureGate.Enabled(features.PodLevelResources) && resourcehelper.IsPodLevelResourcesSet(pod) {
+	if !utilfeature.DefaultFeatureGate.Enabled(features.PodLevelResourceManagers) && utilfeature.DefaultFeatureGate.Enabled(features.PodLevelResources) && resourcehelper.IsPodLevelResourcesSet(pod) {
 		logger.V(3).Info("Topology hints generation skipped, pod is using pod-level resources which are not supported by the static Memory manager policy", "podUID", pod.UID)
 		return nil
 	}

@@ -681,6 +681,12 @@ const (
 	// Enables specifying resources at pod-level.
 	PodLevelResources featuregate.Feature = "PodLevelResources"
 
+	// owner: @kevtorres
+	// key: https://kep.k8s.io/TODO
+	//
+	// Enables pod-level resource management in the topology, CPU, and memory managers.
+	PodLevelResourceManagers featuregate.Feature = "PodLevelResourceManagers"
+
 	// owner: @AxeZhan
 	// kep: http://kep.k8s.io/3960
 	//
@@ -1546,6 +1552,10 @@ var defaultVersionedKubernetesFeatureGates = map[featuregate.Feature]featuregate
 	PodLevelResources: {
 		{Version: version.MustParse("1.32"), Default: false, PreRelease: featuregate.Alpha},
 		{Version: version.MustParse("1.34"), Default: true, PreRelease: featuregate.Beta},
+	},
+
+	PodLevelResourceManagers: {
+		{Version: version.MustParse("1.35"), Default: false, PreRelease: featuregate.Alpha},
 	},
 
 	PodLifecycleSleepAction: {

@@ -315,13 +315,80 @@ func (p *staticPolicy) updateCPUsToReuse(pod *v1.Pod, container *v1.Container, c
 }
 
 func (p *staticPolicy) Allocate(s state.State, pod *v1.Pod, container *v1.Container) (rerr error) {
+	if utilfeature.DefaultFeatureGate.Enabled(features.PodLevelResourceManagers) && utilfeature.DefaultFeatureGate.Enabled(features.PodLevelResources) && resourcehelper.IsPodLevelResourcesSet(pod) {
+		// Check if CPUs are already allocated for this pod
+		assignments := s.GetCPUAssignments()
+		if podAssignments, ok := assignments[string(pod.UID)]; ok {
+			if len(podAssignments) > 0 {
+				// Get the cpuset from the first container in the pod
+				var cset cpuset.CPUSet
+				for _, c := range podAssignments {
+					cset = c
+					break
+				}
+				klog.InfoS("Static policy: Pod already has CPUs allocated, assigning same cpuset to container", "pod", klog.KObj(pod), "containerName", container.Name, "cpuset", cset.String())
+				s.SetCPUSet(string(pod.UID), container.Name, cset)
+				return nil
+			}
+		}
+
+		// This is the first container for this pod. Allocate for the whole pod.
+		numCPUs := p.podGuaranteedCPUs(pod)
+		if numCPUs == 0 {
+			return nil
+		}
+
+		klog.InfoS("Static policy: Allocate pod-level CPUs", "pod", klog.KObj(pod), "numCPUs", numCPUs)
+		metrics.CPUManagerPinningRequestsTotal.Inc()
+		defer func() {
+			if rerr != nil {
+				metrics.CPUManagerPinningErrorsTotal.Inc()
+			}
+		}()
+
+		if p.options.FullPhysicalCPUsOnly {
+			if (numCPUs % p.cpuGroupSize) != 0 {
+				return SMTAlignmentError{
+					RequestedCPUs:        numCPUs,
+					CpusPerCore:          p.cpuGroupSize,
+					CausedByPhysicalCPUs: false,
+				}
+			}
+			availablePhysicalCPUs := p.GetAvailablePhysicalCPUs(s).Size()
+			if numCPUs > availablePhysicalCPUs {
+				return SMTAlignmentError{
+					RequestedCPUs:         numCPUs,
+					CpusPerCore:           p.cpuGroupSize,
+					AvailablePhysicalCPUs: availablePhysicalCPUs,
+					CausedByPhysicalCPUs:  true,
+				}
+			}
+		}
+
+		hint := p.affinity.GetAffinity(string(pod.UID), container.Name)
+		klog.InfoS("Topology Affinity for pod", "pod", klog.KObj(pod), "affinity", hint)
+
+		cpuAllocation, err := p.allocateCPUs(s, numCPUs, hint.NUMANodeAffinity, p.cpusToReuse[string(pod.UID)])
+		if err != nil {
+			klog.ErrorS(err, "Unable to allocate CPUs for pod", "pod", klog.KObj(pod), "numCPUs", numCPUs)
+			return err
+		}
+
+		s.SetCPUSet(string(pod.UID), container.Name, cpuAllocation.CPUs)
+		p.updateCPUsToReuse(pod, container, cpuAllocation.CPUs)
+		p.updateMetricsOnAllocate(s, cpuAllocation)
+
+		klog.V(4).InfoS("Allocated exclusive CPUs for pod", "pod", klog.KObj(pod), "cpuset", cpuAllocation.CPUs.String())
+		return nil
+	}
+
 	numCPUs := p.guaranteedCPUs(pod, container)
 	if numCPUs == 0 {
 		// container belongs in the shared pool (nothing to do; use default cpuset)
 		return nil
 	}
 
-	if utilfeature.DefaultFeatureGate.Enabled(features.PodLevelResources) && resourcehelper.IsPodLevelResourcesSet(pod) {
+	if !utilfeature.DefaultFeatureGate.Enabled(features.PodLevelResourceManagers) && utilfeature.DefaultFeatureGate.Enabled(features.PodLevelResources) && resourcehelper.IsPodLevelResourcesSet(pod) {
 		klog.V(2).InfoS("CPU Manager allocation skipped, pod is using pod-level resources which are not supported by the static CPU manager policy", "pod", klog.KObj(pod), "podUID", pod.UID)
 		return nil
 	}
@@ -501,6 +568,14 @@ func (p *staticPolicy) guaranteedCPUs(pod *v1.Pod, container *v1.Container) int 
 }
 
 func (p *staticPolicy) podGuaranteedCPUs(pod *v1.Pod) int {
+	if utilfeature.DefaultFeatureGate.Enabled(features.PodLevelResourceManagers) && utilfeature.DefaultFeatureGate.Enabled(features.PodLevelResources) && resourcehelper.IsPodLevelResourcesSet(pod) {
+		if cpuQuantity, ok := pod.Spec.Resources.Requests[v1.ResourceCPU]; ok {
+			if cpuQuantity.Value()*1000 == cpuQuantity.MilliValue() {
+				return int(cpuQuantity.Value())
+			}
+		}
+		return 0
+	}
 	// The maximum of requested CPUs by init containers.
 	requestedByInitContainers := 0
 	requestedByRestartableInitContainers := 0
@@ -563,7 +638,7 @@ func (p *staticPolicy) GetTopologyHints(s state.State, pod *v1.Pod, container *v
 		return nil
 	}
 
-	if utilfeature.DefaultFeatureGate.Enabled(features.PodLevelResources) && resourcehelper.IsPodLevelResourcesSet(pod) {
+	if !utilfeature.DefaultFeatureGate.Enabled(features.PodLevelResourceManagers) && utilfeature.DefaultFeatureGate.Enabled(features.PodLevelResources) && resourcehelper.IsPodLevelResourcesSet(pod) {
 		klog.V(3).InfoS("CPU Manager hint generation skipped, pod is using pod-level resources which are not supported by the static CPU manager policy", "pod", klog.KObj(pod), "podUID", pod.UID)
 		return nil
 	}
@@ -615,7 +690,7 @@ func (p *staticPolicy) GetPodTopologyHints(s state.State, pod *v1.Pod) map[strin
 		return nil
 	}
 
-	if utilfeature.DefaultFeatureGate.Enabled(features.PodLevelResources) && resourcehelper.IsPodLevelResourcesSet(pod) {
+	if !utilfeature.DefaultFeatureGate.Enabled(features.PodLevelResourceManagers) && utilfeature.DefaultFeatureGate.Enabled(features.PodLevelResources) && resourcehelper.IsPodLevelResourcesSet(pod) {
 		klog.V(3).InfoS("CPU Manager pod hint generation skipped, pod is using pod-level resources which are not supported by the static CPU manager policy", "pod", klog.KObj(pod), "podUID", pod.UID)
 		return nil
 	}

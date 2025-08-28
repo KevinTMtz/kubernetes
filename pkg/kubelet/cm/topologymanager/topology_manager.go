@@ -43,13 +43,18 @@ const (
 )
 
 // TopologyAffinityError represents an resource alignment error
-type TopologyAffinityError struct{}
+type TopologyAffinityError struct {
+	Msg string
+}
 
-func (e TopologyAffinityError) Error() string {
+func (e *TopologyAffinityError) Error() string {
+	if e.Msg != "" {
+		return e.Msg
+	}
 	return "Resources cannot be allocated with Topology locality"
 }
 
-func (e TopologyAffinityError) Type() string {
+func (e *TopologyAffinityError) Type() string {
 	return ErrorTopologyAffinity
 }
 
