@@ -22,7 +22,9 @@ import (
 	v1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/sets"
+	utilfeature "k8s.io/apiserver/pkg/util/feature"
 	"k8s.io/klog/v2"
+	"k8s.io/kubernetes/pkg/features"
 )
 
 type stateMemory struct {
@@ -52,11 +54,21 @@ func (s *stateMemory) GetContainerResources(podUID types.UID, containerName stri
 		return v1.ResourceRequirements{}, ok
 	}
 
-	resources, ok := resourceInfo.ContainerResources[containerName]
-	if !ok {
-		return v1.ResourceRequirements{}, ok
+	// Prioritize container-specific resources if they exist. This is the case
+	// for containers that have their own resource requests, even within a pod
+	// that has pod-level resources defined.
+	if resources, ok := resourceInfo.ContainerResources[containerName]; ok {
+		return *resources.DeepCopy(), true
 	}
-	return *resources.DeepCopy(), ok
+
+	// Fall back to pod-level resources for containers that are part of the
+	// shared pool. This is the case for containers that do not have their own
+	// resource requests and are running in a pod with pod-level resources.
+	if utilfeature.DefaultFeatureGate.Enabled(features.PodLevelResourceManagers) && (len(resourceInfo.Resources.Requests) > 0 || len(resourceInfo.Resources.Limits) > 0) {
+		return *resourceInfo.Resources.DeepCopy(), true
+	}
+
+	return v1.ResourceRequirements{}, false
 }
 
 func (s *stateMemory) GetPodResourceInfoMap() PodResourceInfoMap {

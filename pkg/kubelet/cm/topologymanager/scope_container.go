@@ -18,7 +18,10 @@ package topologymanager
 
 import (
 	"k8s.io/api/core/v1"
+	utilfeature "k8s.io/apiserver/pkg/util/feature"
+	resourcehelper "k8s.io/component-helpers/resource"
 	"k8s.io/klog/v2"
+	"k8s.io/kubernetes/pkg/features"
 	"k8s.io/kubernetes/pkg/kubelet/cm/admission"
 	"k8s.io/kubernetes/pkg/kubelet/cm/containermap"
 	"k8s.io/kubernetes/pkg/kubelet/lifecycle"
@@ -45,6 +48,11 @@ func NewContainerScope(policy Policy) Scope {
 }
 
 func (s *containerScope) Admit(pod *v1.Pod) lifecycle.PodAdmitResult {
+	if !utilfeature.DefaultFeatureGate.Enabled(features.PodLevelResourceManagers) && utilfeature.DefaultFeatureGate.Enabled(features.PodLevelResources) && resourcehelper.IsPodLevelResourcesSet(pod) {
+		return admission.GetPodAdmitResult(&TopologyAffinityError{
+			Msg: "pod with pod-level resources is not compatible with the container scope without PodLevelResourceManagers feature enabled",
+		})
+	}
 	for _, container := range append(pod.Spec.InitContainers, pod.Spec.Containers...) {
 		bestHint, admit := s.calculateAffinity(pod, &container)
 		klog.InfoS("Best TopologyHint", "bestHint", bestHint, "pod", klog.KObj(pod), "containerName", container.Name)

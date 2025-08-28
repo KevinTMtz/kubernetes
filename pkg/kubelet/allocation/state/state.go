@@ -24,8 +24,9 @@ import (
 
 // PodResourceInfo stores resource requirements for containers within a pod.
 type PodResourceInfo struct {
+	Resources v1.ResourceRequirements `json:"resources,omitempty"`
 	// ContainerResources maps container names to their respective ResourceRequirements.
-	ContainerResources map[string]v1.ResourceRequirements
+	ContainerResources map[string]v1.ResourceRequirements `json:"containerResources,omitempty"`
 }
 
 // PodResourceInfoMap maps pod UIDs to their corresponding PodResourceInfo,
@@ -37,6 +38,7 @@ func (pr PodResourceInfoMap) Clone() PodResourceInfoMap {
 	prCopy := make(PodResourceInfoMap)
 	for podUID, podInfo := range pr {
 		prCopy[podUID] = PodResourceInfo{
+			Resources:          *podInfo.Resources.DeepCopy(),
 			ContainerResources: make(map[string]v1.ResourceRequirements),
 		}
 		for containerName, containerInfo := range podInfo.ContainerResources {

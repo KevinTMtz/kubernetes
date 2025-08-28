@@ -488,6 +488,16 @@ func updatePodFromAllocation(pod *v1.Pod, allocated state.PodResourceInfo) (*v1.
 	}
 
 	updated := false
+	if utilfeature.DefaultFeatureGate.Enabled(features.PodLevelResourceManagers) &&
+		(len(allocated.Resources.Requests) > 0 || len(allocated.Resources.Limits) > 0) {
+		if !apiequality.Semantic.DeepEqual(pod.Spec.Resources, allocated.Resources) {
+			pod = pod.DeepCopy()
+			updated = true
+			pod.Spec.Resources = &allocated.Resources
+		}
+		return pod, updated
+	}
+
 	containerAlloc := func(c v1.Container) (v1.ResourceRequirements, bool) {
 		if cAlloc, ok := allocated.ContainerResources[c.Name]; ok {
 			if !apiequality.Semantic.DeepEqual(c.Resources, cAlloc) {
@@ -525,6 +535,12 @@ func (m *manager) SetAllocatedResources(pod *v1.Pod) error {
 
 func allocationFromPod(pod *v1.Pod) state.PodResourceInfo {
 	var podAlloc state.PodResourceInfo
+	// If the pod is using pod-level resources, we populate the `Resources` field.
+	if utilfeature.DefaultFeatureGate.Enabled(features.PodLevelResourceManagers) && utilfeature.DefaultFeatureGate.Enabled(features.PodLevelResources) && resourcehelper.IsPodLevelResourcesSet(pod) {
+		podAlloc.Resources = *pod.Spec.Resources.DeepCopy()
+	}
+	// We always populate the `ContainerResources` map with the resources of the
+	// individual containers, regardless of whether pod-level resources are set.
 	podAlloc.ContainerResources = make(map[string]v1.ResourceRequirements)
 	for _, container := range pod.Spec.Containers {
 		alloc := *container.Resources.DeepCopy()
