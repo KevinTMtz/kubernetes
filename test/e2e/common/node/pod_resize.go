@@ -110,8 +110,7 @@ func doGuaranteedPodResizeTests(f *framework.Framework) {
 				expectedContainers[i] = c
 			}
 
-			doPatchAndRollback(ctx, f, originalContainers, expectedContainers, true)
-
+			doPatchAndRollback(ctx, f, originalContainers, expectedContainers, nil, nil, true)
 		},
 			// All tests will perform the requested resize, and once completed, will roll back the change.
 			// This results in the coverage of both increase and decrease of resources.
@@ -159,7 +158,7 @@ func doGuaranteedPodResizeTests(f *framework.Framework) {
 				},
 			}
 
-			doPatchAndRollback(ctx, f, originalContainers, expectedContainers, true)
+			doPatchAndRollback(ctx, f, originalContainers, expectedContainers, nil, nil, true)
 		})
 
 		/*
@@ -189,7 +188,7 @@ func doGuaranteedPodResizeTests(f *framework.Framework) {
 				},
 			}
 
-			doPatchAndRollback(ctx, f, originalContainers, expectedContainers, true)
+			doPatchAndRollback(ctx, f, originalContainers, expectedContainers, nil, nil, true)
 		})
 
 		/*
@@ -219,40 +218,47 @@ func doGuaranteedPodResizeTests(f *framework.Framework) {
 				},
 			}
 
-			doPatchAndRollback(ctx, f, originalContainers, expectedContainers, true)
+			doPatchAndRollback(ctx, f, originalContainers, expectedContainers, nil, nil, true)
 		})
 	})
 }
 
+type resourceRequestsLimits struct {
+	cpuReq string
+	cpuLim string
+	memReq string
+	memLim string
+}
+
 func doBurstablePodResizeTests(f *framework.Framework) {
 	ginkgo.DescribeTableSubtree("burstable pods - 1 container with all requests & limits set and resize policy", func(cpuPolicy, memPolicy v1.ResourceResizeRestartPolicy) {
-		ginkgo.DescribeTable("resizing", func(ctx context.Context, desiredCPU, desiredCPULimit, desiredMem, desiredMemLimit string) {
+		ginkgo.DescribeTable("resizing", func(ctx context.Context, desiredContainerResources resourceRequestsLimits) {
 			originalContainers := makeBurstableContainers(1, cpuPolicy, memPolicy, originalCPU, originalCPULimit, originalMem, originalMemLimit)
-			expectedContainers := makeBurstableContainers(1, cpuPolicy, memPolicy, desiredCPU, desiredCPULimit, desiredMem, desiredMemLimit)
+			expectedContainers := makeBurstableContainers(1, cpuPolicy, memPolicy, desiredContainerResources.cpuReq, desiredContainerResources.cpuLim, desiredContainerResources.memReq, desiredContainerResources.memLim)
 			for i, c := range expectedContainers {
 				// For containers where the resize policy is "restart", we expect a restart.
 				expectRestart := int32(0)
-				if cpuPolicy == v1.RestartContainer && (desiredCPU != originalCPU || desiredCPULimit != originalCPULimit) {
+				if cpuPolicy == v1.RestartContainer && (desiredContainerResources.cpuReq != originalCPU || desiredContainerResources.cpuLim != originalCPULimit) {
 					expectRestart = 1
 				}
-				if memPolicy == v1.RestartContainer && (desiredMem != originalMem || desiredMemLimit != originalMemLimit) {
+				if memPolicy == v1.RestartContainer && (desiredContainerResources.memReq != originalMem || desiredContainerResources.memLim != originalMemLimit) {
 					expectRestart = 1
 				}
 				c.RestartCount = expectRestart
 				expectedContainers[i] = c
 			}
 
-			doPatchAndRollback(ctx, f, originalContainers, expectedContainers, true)
+			doPatchAndRollback(ctx, f, originalContainers, expectedContainers, nil, nil, true)
 		},
 			// All tests will perform the requested resize, and once completed, will roll back the change.
 			// This results in the coverage of both increase and decrease of resources.
-			ginkgo.Entry("cpu requests", increasedCPU, originalCPULimit, originalMem, originalMemLimit),
-			ginkgo.Entry("cpu limits", originalCPU, increasedCPULimit, originalMem, originalMemLimit),
-			ginkgo.Entry("mem requests", originalCPU, originalCPULimit, increasedMem, originalMemLimit),
-			ginkgo.Entry("mem limits", originalCPU, originalCPULimit, originalMem, increasedMemLimit),
-			ginkgo.Entry("all resources in the same direction", increasedCPU, increasedCPULimit, increasedMem, increasedMemLimit),
-			ginkgo.Entry("cpu & mem in opposite directions", increasedCPU, increasedCPULimit, reducedMem, reducedMemLimit),
-			ginkgo.Entry("requests & limits in opposite directions", reducedCPU, increasedCPULimit, increasedMem, reducedMemLimit),
+			ginkgo.Entry("cpu requests", resourceRequestsLimits{increasedCPU, originalCPULimit, originalMem, originalMemLimit}),
+			ginkgo.Entry("cpu limits", resourceRequestsLimits{originalCPU, increasedCPULimit, originalMem, originalMemLimit}),
+			ginkgo.Entry("mem requests", resourceRequestsLimits{originalCPU, originalCPULimit, increasedMem, originalMemLimit}),
+			ginkgo.Entry("mem limits", resourceRequestsLimits{originalCPU, originalCPULimit, originalMem, increasedMemLimit}),
+			ginkgo.Entry("all resources in the same direction", resourceRequestsLimits{increasedCPU, increasedCPULimit, increasedMem, increasedMemLimit}),
+			ginkgo.Entry("cpu & mem in opposite directions", resourceRequestsLimits{increasedCPU, increasedCPULimit, reducedMem, reducedMemLimit}),
+			ginkgo.Entry("requests & limits in opposite directions", resourceRequestsLimits{reducedCPU, increasedCPULimit, increasedMem, reducedMemLimit}),
 		)
 	},
 		ginkgo.Entry("no restart", v1.NotRequired, v1.NotRequired),
@@ -269,7 +275,7 @@ func doBurstablePodResizeTests(f *framework.Framework) {
 	ginkgo.Describe("burstable pods - extended", func() {
 		/*
 			Release: v1.35
-			Testname: In-place Pod Resize, burtable pod with multiple containers and various operations
+			Testname: In-place Pod Resize, burstable pod with multiple containers and various operations
 			Description: Issuing a Pod Resize request via the Pod Resize subresource patch endpoint to modify CPU and memory requests and limits on a 6-container pod with various operations MUST result in the Pod resources being updated as expected.
 		*/
 		framework.ConformanceIt("6 containers - various operations performed (including adding limits and requests) [MinimumKubeletVersion:1.34]", func(ctx context.Context) {
@@ -327,7 +333,7 @@ func doBurstablePodResizeTests(f *framework.Framework) {
 					Resources: &cgroups.ContainerResources{CPUReq: originalCPU, MemReq: increasedMem},
 				},
 			}
-			doPatchAndRollback(ctx, f, originalContainers, expectedContainers, false)
+			doPatchAndRollback(ctx, f, originalContainers, expectedContainers, nil, nil, false)
 		})
 
 		/*
@@ -348,7 +354,7 @@ func doBurstablePodResizeTests(f *framework.Framework) {
 					Resources: &cgroups.ContainerResources{CPUReq: "1m", CPULim: "5m"},
 				},
 			}
-			doPatchAndRollback(ctx, f, originalContainers, expectedContainers, true)
+			doPatchAndRollback(ctx, f, originalContainers, expectedContainers, nil, nil, true)
 		})
 	})
 }
@@ -360,16 +366,16 @@ func doPodResizePatchErrorTests(f *framework.Framework) {
 
 		ginkgo.By("creating and verifying pod")
 		if waitForStart {
-			newPod = createAndVerifyPod(ctx, f, podClient, originalContainers)
+			newPod = createAndVerifyPod(ctx, f, podClient, originalContainers, nil)
 		} else {
 			tStamp := strconv.Itoa(time.Now().Nanosecond())
-			testPod := podresize.MakePodWithResizableContainers(f.Namespace.Name, "testpod", tStamp, originalContainers)
+			testPod := podresize.MakePodWithResizableContainers(f.Namespace.Name, "testpod", tStamp, originalContainers, nil)
 			testPod = e2epod.MustMixinRestrictedPodSecurity(testPod)
 			newPod = podClient.Create(ctx, testPod)
 		}
 
 		ginkgo.By("patching pod for resize")
-		patch := podresize.MakeResizePatch(originalContainers, desiredContainers)
+		patch := podresize.MakeResizePatch(originalContainers, desiredContainers, nil, nil)
 		_, pErr := f.ClientSet.CoreV1().Pods(newPod.Namespace).Patch(ctx, newPod.Name,
 			types.StrategicMergePatchType, patch, metav1.PatchOptions{}, "resize")
 		gomega.Expect(pErr).To(gomega.HaveOccurred())
@@ -379,7 +385,7 @@ func doPodResizePatchErrorTests(f *framework.Framework) {
 		framework.ExpectNoError(getErr)
 
 		ginkgo.By("verifying pod resources after patch")
-		podresize.VerifyPodResources(patchedPod, originalContainers)
+		podresize.VerifyPodResources(patchedPod, originalContainers, nil)
 
 		if waitForStart {
 			ginkgo.By("verifying pod status resources after patch")
@@ -607,7 +613,7 @@ func doPodResizeMemoryLimitDecreaseTest(f *framework.Framework) {
 		}}
 
 		ginkgo.By("creating and verifying pod")
-		testPod := createAndVerifyPod(ctx, f, podClient, original)
+		testPod := createAndVerifyPod(ctx, f, podClient, original, nil)
 
 		// 1. Decrease the limit a little bit - should succeed
 		ginkgo.By("Patching pod with a slightly lowered memory limit")
@@ -615,13 +621,13 @@ func doPodResizeMemoryLimitDecreaseTest(f *framework.Framework) {
 			Name:      "c1",
 			Resources: &cgroups.ContainerResources{MemReq: reducedMem, MemLim: reducedMem},
 		}}
-		patch := podresize.MakeResizePatch(original, viableLoweredLimit)
+		patch := podresize.MakeResizePatch(original, viableLoweredLimit, nil, nil)
 		testPod, pErr := f.ClientSet.CoreV1().Pods(testPod.Namespace).Patch(ctx, testPod.Name,
 			types.StrategicMergePatchType, patch, metav1.PatchOptions{}, "resize")
 		framework.ExpectNoError(pErr, "failed to patch pod for viable lowered limit")
 
 		ginkgo.By("verifying pod patched for viable lowered limit")
-		podresize.VerifyPodResources(testPod, viableLoweredLimit)
+		podresize.VerifyPodResources(testPod, viableLoweredLimit, nil)
 
 		ginkgo.By("waiting for viable lowered limit to be actuated")
 		resizedPod := podresize.WaitForPodResizeActuation(ctx, f, podClient, testPod, viableLoweredLimit)
@@ -641,7 +647,7 @@ func doPodResizeMemoryLimitDecreaseTest(f *framework.Framework) {
 			Name:      "c1",
 			Resources: &cgroups.ContainerResources{MemReq: nonViableMemoryLimit, MemLim: nonViableMemoryLimit},
 		}}
-		patch = podresize.MakeResizePatch(viableLoweredLimit, nonViableLoweredLimit)
+		patch = podresize.MakeResizePatch(viableLoweredLimit, nonViableLoweredLimit, nil, nil)
 		testPod, pErr = f.ClientSet.CoreV1().Pods(testPod.Namespace).Patch(ctx, testPod.Name,
 			types.StrategicMergePatchType, patch, metav1.PatchOptions{}, "resize")
 		framework.ExpectNoError(pErr, "failed to patch pod for viable lowered limit")
@@ -688,13 +694,13 @@ func doPodResizeMemoryLimitDecreaseTest(f *framework.Framework) {
 
 		// 3. Revert the limit back to the original value - should succeed
 		ginkgo.By("Patching pod to revert to original state")
-		patch = podresize.MakeResizePatch(nonViableLoweredLimit, original)
+		patch = podresize.MakeResizePatch(nonViableLoweredLimit, original, nil, nil)
 		testPod, pErr = f.ClientSet.CoreV1().Pods(testPod.Namespace).Patch(ctx, testPod.Name,
 			types.StrategicMergePatchType, patch, metav1.PatchOptions{}, "resize")
 		framework.ExpectNoError(pErr, "failed to patch pod back to original values")
 
 		ginkgo.By("verifying pod patched for original values")
-		podresize.VerifyPodResources(testPod, original)
+		podresize.VerifyPodResources(testPod, original, nil)
 
 		ginkgo.By("waiting for the original values to be actuated")
 		resizedPod = podresize.WaitForPodResizeActuation(ctx, f, podClient, testPod, original)
@@ -729,7 +735,7 @@ func doPodResizeReadAndReplaceTests(f *framework.Framework) {
 		}
 
 		ginkgo.By("creating and verifying pod")
-		pod := createAndVerifyPod(ctx, f, podClient, original)
+		pod := createAndVerifyPod(ctx, f, podClient, original, nil)
 		gomega.Expect(pod.Generation).To(gomega.BeEquivalentTo(1))
 
 		podToUpdate, err := podClient.Get(ctx, pod.Name, metav1.GetOptions{})
@@ -745,7 +751,7 @@ func doPodResizeReadAndReplaceTests(f *framework.Framework) {
 		framework.ExpectNoError(err, "failed to get pod")
 
 		ginkgo.By("verifying pod resources")
-		podresize.VerifyPodResources(updatedPod, desiredContainers)
+		podresize.VerifyPodResources(updatedPod, desiredContainers, nil)
 		gomega.Expect(updatedPod.Generation).To(gomega.BeEquivalentTo(2))
 
 		ginkgo.By("verifying pod resources after patch")
@@ -813,46 +819,44 @@ var _ = SIGDescribe("Pod InPlace Resize Container", func() {
 	doPodResizeMemoryLimitDecreaseTest(f)
 })
 
-func doPatchAndRollback(ctx context.Context, f *framework.Framework, originalContainers, expectedContainers []podresize.ResizableContainerInfo, doRollback bool) {
+func doPatchAndRollback(ctx context.Context, f *framework.Framework, originalContainers, expectedContainers []podresize.ResizableContainerInfo, originalPodResources, expectedPodResources *v1.ResourceRequirements, doRollback bool) {
 	ginkgo.By("creating and verifying pod")
 	podClient := e2epod.NewPodClient(f)
-	newPod := createAndVerifyPod(ctx, f, podClient, originalContainers)
+	newPod := createAndVerifyPod(ctx, f, podClient, originalContainers, originalPodResources)
 
 	ginkgo.By("patching and verifying pod for resize")
-	patchAndVerify(ctx, f, podClient, newPod, originalContainers, expectedContainers, "resize")
-
+	patchAndVerify(ctx, f, podClient, newPod, originalContainers, expectedContainers, originalPodResources, expectedPodResources, "resize")
 	if doRollback {
 		// Resize has been actuated, test the reverse operation.
 		rollbackContainers := createRollbackContainers(originalContainers, expectedContainers)
 		ginkgo.By("patching and verifying pod for rollback")
-		patchAndVerify(ctx, f, podClient, newPod, expectedContainers, rollbackContainers, "rollback")
+		patchAndVerify(ctx, f, podClient, newPod, expectedContainers, rollbackContainers, expectedPodResources, originalPodResources, "rollback")
 	}
 
 	ginkgo.By("deleting pod")
 	podClient.DeleteSync(ctx, newPod.Name, metav1.DeleteOptions{}, f.Timeouts.PodDelete)
 }
 
-func patchAndVerify(ctx context.Context, f *framework.Framework, podClient *e2epod.PodClient, newPod *v1.Pod, originalContainers, expectedContainers []podresize.ResizableContainerInfo, opStr string) {
-	patch := podresize.MakeResizePatch(originalContainers, expectedContainers)
+func patchAndVerify(ctx context.Context, f *framework.Framework, podClient *e2epod.PodClient, newPod *v1.Pod, originalContainers, expectedContainers []podresize.ResizableContainerInfo, originalPodResources, expectedPodResources *v1.ResourceRequirements, opStr string) {
+	patch := podresize.MakeResizePatch(originalContainers, expectedContainers, originalPodResources, expectedPodResources)
 	patchedPod, pErr := f.ClientSet.CoreV1().Pods(newPod.Namespace).Patch(ctx, newPod.Name,
 		types.StrategicMergePatchType, patch, metav1.PatchOptions{}, "resize")
 	framework.ExpectNoError(pErr, fmt.Sprintf("failed to patch pod for %s", opStr))
 
 	expected := podresize.UpdateExpectedContainerRestarts(ctx, patchedPod, expectedContainers)
 
-	podresize.VerifyPodResources(patchedPod, expected)
+	podresize.VerifyPodResources(patchedPod, expected, expectedPodResources)
 	resizedPod := podresize.WaitForPodResizeActuation(ctx, f, podClient, newPod, expected)
 	podresize.ExpectPodResized(ctx, f, resizedPod, expected)
 }
 
-func createAndVerifyPod(ctx context.Context, f *framework.Framework, podClient *e2epod.PodClient, originalContainers []podresize.ResizableContainerInfo) *v1.Pod {
+func createAndVerifyPod(ctx context.Context, f *framework.Framework, podClient *e2epod.PodClient, originalContainers []podresize.ResizableContainerInfo, podResources *v1.ResourceRequirements) *v1.Pod {
 	tStamp := strconv.Itoa(time.Now().Nanosecond())
-	testPod := podresize.MakePodWithResizableContainers(f.Namespace.Name, "", tStamp, originalContainers)
+	testPod := podresize.MakePodWithResizableContainers(f.Namespace.Name, "", tStamp, originalContainers, podResources)
 	testPod.GenerateName = "resize-test-"
 	testPod = e2epod.MustMixinRestrictedPodSecurity(testPod)
-
 	newPod := podClient.CreateSync(ctx, testPod)
-	podresize.VerifyPodResources(newPod, originalContainers)
+	podresize.VerifyPodResources(newPod, originalContainers, podResources)
 	podresize.VerifyPodResizePolicy(newPod, originalContainers)
 	framework.ExpectNoError(podresize.VerifyPodStatusResources(newPod, originalContainers))
 	framework.ExpectNoError(podresize.VerifyPodContainersCgroupValues(ctx, f, newPod, originalContainers))

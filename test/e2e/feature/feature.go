@@ -210,6 +210,11 @@ var (
 	// Ingress.networking.k8s.io to be present.
 	Ingress = framework.WithFeature(framework.ValidFeatures.Add("Ingress"))
 
+	// owner: sig-node
+	// Marks a test for pod-level resources feature that requires
+	// InPlacePodLevelResourcesVerticalScaling feature gate to be enabled.
+	InPlacePodLevelResourcesVerticalScaling = framework.WithFeature(framework.ValidFeatures.Add("InPlacePodLevelResourcesVerticalScaling"))
+
 	// TODO: document the feature (owning SIG, when to use this feature for a test)
 	Kind = framework.WithFeature(framework.ValidFeatures.Add("Kind"))
 
@@ -324,7 +329,7 @@ var (
 	PodGarbageCollector = framework.WithFeature(framework.ValidFeatures.Add("PodGarbageCollector"))
 
 	// owner: sig-node
-	// Marks a test for for pod-level resources feature that requires
+	// Marks a test for pod-level resources feature that requires
 	// PodLevelResources feature gate to be enabled.
 	PodLevelResources = framework.WithFeature(framework.ValidFeatures.Add("PodLevelResources"))
 
