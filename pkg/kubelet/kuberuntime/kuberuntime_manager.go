@@ -2049,7 +2049,7 @@ func (m *kubeGenericRuntimeManager) isPodLevelResourcesResizeInProgress(allocate
 	actuatedPodResources, _ := m.actuatedState.GetPodLevelResources(allocatedPod.UID)
 	allocatedPodResources := allocatedPod.Spec.Resources
 
-	return cpuMemoryResourcesEqual(actuatedPodResources, allocatedPodResources)
+	return !cpuMemoryResourcesEqual(actuatedPodResources, allocatedPodResources)
 }
 
 func cpuMemoryResourcesEqual(actuatedPodResources, allocatedPodResources *v1.ResourceRequirements) bool {
