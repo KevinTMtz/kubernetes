@@ -3878,10 +3878,11 @@ func TestIsPodResizeInProgress(t *testing.T) {
 	}
 
 	tests := []struct {
-		name              string
-		podLevelResources *testPLR
-		containers        []testContainer
-		expectHasResize   bool
+		name                         string
+		podLevelResources            *testPLR
+		containers                   []testContainer
+		expectHasResize              bool
+		inplacePodLevelResizeEnabled bool
 	}{{
 		name: "simple running container",
 		containers: []testContainer{{
@@ -4066,7 +4067,34 @@ func TestIsPodResizeInProgress(t *testing.T) {
 			actuated:  &testResources{},
 			isRunning: true,
 		}},
-		expectHasResize: true,
+		expectHasResize:              true,
+		inplacePodLevelResizeEnabled: true,
+	}, {
+		name: "only-plr/resizing feature gate disabled",
+		podLevelResources: &testPLR{
+			allocated: testResources{cpuReq: 200},
+			actuated:  &testResources{cpuReq: 100},
+		},
+		containers: []testContainer{{
+			allocated: testResources{},
+			actuated:  &testResources{},
+			isRunning: true,
+		}},
+		expectHasResize:              false,
+		inplacePodLevelResizeEnabled: false,
+	}, {
+		name: "plr/container resizing featuregate disabled",
+		podLevelResources: &testPLR{
+			allocated: testResources{cpuReq: 100},
+			actuated:  &testResources{cpuReq: 100},
+		},
+		containers: []testContainer{{
+			allocated: testResources{cpuReq: 100},
+			actuated:  &testResources{cpuReq: 50},
+			isRunning: true,
+		}},
+		expectHasResize:              true,
+		inplacePodLevelResizeEnabled: false,
 	}, {
 		name: "plr/container resizing",
 		podLevelResources: &testPLR{
@@ -4078,7 +4106,8 @@ func TestIsPodResizeInProgress(t *testing.T) {
 			actuated:  &testResources{cpuReq: 50},
 			isRunning: true,
 		}},
-		expectHasResize: true,
+		expectHasResize:              true,
+		inplacePodLevelResizeEnabled: true,
 	}, {
 		name: "plr/pod resizing",
 		podLevelResources: &testPLR{
@@ -4090,7 +4119,8 @@ func TestIsPodResizeInProgress(t *testing.T) {
 			actuated:  &testResources{memReq: 100},
 			isRunning: true,
 		}},
-		expectHasResize: true,
+		expectHasResize:              true,
+		inplacePodLevelResizeEnabled: true,
 	}}
 
 	mkRequirements := func(r testResources) v1.ResourceRequirements {
@@ -4125,6 +4155,9 @@ func TestIsPodResizeInProgress(t *testing.T) {
 
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
+			if test.inplacePodLevelResizeEnabled {
+				featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, features.InPlacePodLevelResourcesVerticalScaling, true)
+			}
 			tCtx := ktesting.Init(t)
 			_, _, m, err := createTestRuntimeManager(tCtx)
 			require.NoError(t, err)
