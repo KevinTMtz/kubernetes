@@ -2380,7 +2380,6 @@ func TestComputePodActionsForPodResize(t *testing.T) {
 					ContainersToStart:  []int{},
 					ContainersToKill:   getKillMap(pod, podStatus, []int{}),
 					ContainersToUpdate: map[v1.ResourceName][]containerToUpdateInfo{},
-					UpdatePodResources: false,
 				}
 				return &pa
 			},
@@ -2406,11 +2405,11 @@ func TestComputePodActionsForPodResize(t *testing.T) {
 			},
 			getExpectedPodActionsFn: func(pod *v1.Pod, podStatus *kubecontainer.PodStatus) *podActions {
 				pa := podActions{
-					SandboxID:          podStatus.SandboxStatuses[0].Id,
-					ContainersToStart:  []int{},
-					ContainersToKill:   getKillMap(pod, podStatus, []int{}),
-					ContainersToUpdate: map[v1.ResourceName][]containerToUpdateInfo{},
-					UpdatePodResources: true,
+					SandboxID:               podStatus.SandboxStatuses[0].Id,
+					ContainersToStart:       []int{},
+					ContainersToKill:        getKillMap(pod, podStatus, []int{}),
+					ContainersToUpdate:      map[v1.ResourceName][]containerToUpdateInfo{},
+					UpdatePodLevelResources: true,
 				}
 				return &pa
 			},
@@ -2530,7 +2529,7 @@ func TestComputePodActionsForPodResize(t *testing.T) {
 							},
 						},
 					},
-					UpdatePodResources: true,
+					UpdatePodLevelResources: true,
 				}
 				return &pa
 			},
