@@ -4211,7 +4211,7 @@ func TestCmpActuatedAllocated(t *testing.T) {
 
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			gotEqual := cmpActuatedAllocated(test.actuatedResources, test.allocatedResources)
+			gotEqual := cpuMemoryResourcesEqual(test.actuatedResources, test.allocatedResources)
 			assert.Equal(t, test.cpuMemoryequal, gotEqual)
 		})
 	}

@@ -22,6 +22,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"reflect"
 	"sort"
 	"strconv"
 	"strings"
@@ -2052,36 +2053,30 @@ func (m *kubeGenericRuntimeManager) isPodLevelResourcesResizeInProgress(allocate
 }
 
 func cpuMemoryResourcesEqual(actuatedPodResources, allocatedPodResources *v1.ResourceRequirements) bool {
-	// TODO(ndixita): refactor to a separate function for safe access of nil pointer
-	// values
+	if actuatedPodResources == nil && allocatedPodResources == nil {
+		return true
+	}
+
+	cmpResources := func(actuated, allocated v1.ResourceList) bool {
+		if !reflect.DeepEqual(actuated[v1.ResourceCPU], allocated[v1.ResourceCPU]) {
+			return false
+		}
+
+		if !reflect.DeepEqual(actuated[v1.ResourceMemory], allocated[v1.ResourceMemory]) {
+			return false
+		}
+		return true
+	}
+
 	if actuatedPodResources == nil {
-		actuatedPodResources = &v1.ResourceRequirements{}
+		return cmpResources(nil, allocatedPodResources.Requests) && cmpResources(nil, allocatedPodResources.Limits)
 	}
 
 	if allocatedPodResources == nil {
-		allocatedPodResources = &v1.ResourceRequirements{}
-	}
+		return cmpResources(actuatedPodResources.Requests, nil) && cmpResources(actuatedPodResources.Limits, nil)
 
-	if actuatedPodResources.Requests == nil {
-		actuatedPodResources.Requests = make(v1.ResourceList)
 	}
-
-	if actuatedPodResources.Limits == nil {
-		actuatedPodResources.Limits = make(v1.ResourceList)
-	}
-
-	if allocatedPodResources.Requests == nil {
-		allocatedPodResources.Requests = make(v1.ResourceList)
-	}
-
-	if allocatedPodResources.Limits == nil {
-		allocatedPodResources.Limits = make(v1.ResourceList)
-	}
-
-	return allocatedPodResources.Requests[v1.ResourceCPU].Equal(actuatedPodResources.Requests[v1.ResourceCPU]) &&
-		allocatedPodResources.Limits[v1.ResourceCPU].Equal(actuatedPodResources.Limits[v1.ResourceCPU]) &&
-		allocatedPodResources.Requests[v1.ResourceMemory].Equal(actuatedPodResources.Requests[v1.ResourceMemory]) &&
-		allocatedPodResources.Limits[v1.ResourceMemory].Equal(actuatedPodResources.Limits[v1.ResourceMemory])
+	return cmpResources(actuatedPodResources.Requests, allocatedPodResources.Requests) && cmpResources(actuatedPodResources.Limits, allocatedPodResources.Limits)
 }
 
 func isResizableContainer(container *v1.Container, containerType podutil.ContainerType) bool {
