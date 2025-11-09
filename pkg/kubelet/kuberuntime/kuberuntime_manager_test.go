@@ -2334,6 +2334,10 @@ func TestComputePodActionsForPodResize(t *testing.T) {
 	cpu200m := resource.MustParse("200m")
 	mem100M := resource.MustParse("100Mi")
 	mem200M := resource.MustParse("200Mi")
+	cpu300m := resource.MustParse("300m")
+	cpu600m := resource.MustParse("600m")
+	mem300M := resource.MustParse("300Mi")
+	mem600M := resource.MustParse("600Mi")
 	cpuPolicyRestartNotRequired := v1.ContainerResizePolicy{ResourceName: v1.ResourceCPU, RestartPolicy: v1.NotRequired}
 	memPolicyRestartNotRequired := v1.ContainerResizePolicy{ResourceName: v1.ResourceMemory, RestartPolicy: v1.NotRequired}
 	cpuPolicyRestartRequired := v1.ContainerResizePolicy{ResourceName: v1.ResourceCPU, RestartPolicy: v1.RestartContainer}
@@ -2386,20 +2390,28 @@ func TestComputePodActionsForPodResize(t *testing.T) {
 		},
 		"Update pod-level CPU and memory resources": {
 			setupFn: func(pod *v1.Pod) {
-				c := &pod.Spec.Containers[1]
-				c.Resources = v1.ResourceRequirements{
-					Limits: v1.ResourceList{v1.ResourceCPU: cpu100m, v1.ResourceMemory: mem100M},
+				for i, container := range pod.Spec.Containers {
+					container.Resources = v1.ResourceRequirements{
+						Limits: v1.ResourceList{v1.ResourceCPU: cpu100m, v1.ResourceMemory: mem100M},
+					}
+					pod.Spec.Containers[i].Resources = container.Resources
+
+					setupActuatedResources(pod, &container, v1.ResourceRequirements{
+						Limits: v1.ResourceList{
+							v1.ResourceCPU:    cpu100m.DeepCopy(),
+							v1.ResourceMemory: mem100M.DeepCopy(),
+						},
+					})
 				}
-				setupActuatedResources(pod, c, v1.ResourceRequirements{
+
+				pod.Spec.Resources = &v1.ResourceRequirements{
+					Limits: v1.ResourceList{v1.ResourceCPU: cpu200m, v1.ResourceMemory: mem200M},
+				}
+
+				setupActuatedPodResources(pod, &v1.ResourceRequirements{
 					Limits: v1.ResourceList{
 						v1.ResourceCPU:    cpu100m.DeepCopy(),
 						v1.ResourceMemory: mem100M.DeepCopy(),
-					},
-				})
-				setupActuatedPodResources(pod, &v1.ResourceRequirements{
-					Limits: v1.ResourceList{
-						v1.ResourceCPU:    cpu200m.DeepCopy(),
-						v1.ResourceMemory: mem200M.DeepCopy(),
 					},
 				})
 			},
@@ -2476,20 +2488,33 @@ func TestComputePodActionsForPodResize(t *testing.T) {
 		},
 		"Update pod-level resources and container CPU and memory resources": {
 			setupFn: func(pod *v1.Pod) {
-				c := &pod.Spec.Containers[1]
-				c.Resources = v1.ResourceRequirements{
+				c0 := &pod.Spec.Containers[0]
+				c0.Resources = v1.ResourceRequirements{
 					Limits: v1.ResourceList{v1.ResourceCPU: cpu100m, v1.ResourceMemory: mem100M},
 				}
-				setupActuatedResources(pod, c, v1.ResourceRequirements{
-					Limits: v1.ResourceList{
-						v1.ResourceCPU:    cpu200m.DeepCopy(),
-						v1.ResourceMemory: mem200M.DeepCopy(),
-					},
-				})
+				c1 := &pod.Spec.Containers[1]
+				c1.Resources = v1.ResourceRequirements{
+					Limits: v1.ResourceList{v1.ResourceCPU: cpu200m, v1.ResourceMemory: mem200M},
+				}
+				c2 := &pod.Spec.Containers[2]
+				c2.Resources = v1.ResourceRequirements{
+					Limits: v1.ResourceList{v1.ResourceCPU: cpu100m, v1.ResourceMemory: mem100M},
+				}
+				for _, container := range pod.Spec.Containers {
+					setupActuatedResources(pod, &container, v1.ResourceRequirements{
+						Limits: v1.ResourceList{
+							v1.ResourceCPU:    cpu100m.DeepCopy(),
+							v1.ResourceMemory: mem100M.DeepCopy(),
+						},
+					})
+				}
+				pod.Spec.Resources = &v1.ResourceRequirements{
+					Limits: v1.ResourceList{v1.ResourceCPU: cpu600m, v1.ResourceMemory: mem600M},
+				}
 				setupActuatedPodResources(pod, &v1.ResourceRequirements{
 					Limits: v1.ResourceList{
-						v1.ResourceCPU:    cpu200m.DeepCopy(),
-						v1.ResourceMemory: mem200M.DeepCopy(),
+						v1.ResourceCPU:    cpu300m.DeepCopy(),
+						v1.ResourceMemory: mem300M.DeepCopy(),
 					},
 				})
 			},
@@ -2505,12 +2530,12 @@ func TestComputePodActionsForPodResize(t *testing.T) {
 								container:       &pod.Spec.Containers[1],
 								kubeContainerID: kcs.ID,
 								desiredContainerResources: containerResources{
-									memoryLimit: mem100M.Value(),
-									cpuLimit:    cpu100m.MilliValue(),
-								},
-								currentContainerResources: &containerResources{
 									memoryLimit: mem200M.Value(),
 									cpuLimit:    cpu200m.MilliValue(),
+								},
+								currentContainerResources: &containerResources{
+									memoryLimit: mem100M.Value(),
+									cpuLimit:    cpu100m.MilliValue(),
 								},
 							},
 						},
@@ -2519,12 +2544,88 @@ func TestComputePodActionsForPodResize(t *testing.T) {
 								container:       &pod.Spec.Containers[1],
 								kubeContainerID: kcs.ID,
 								desiredContainerResources: containerResources{
+									memoryLimit: mem200M.Value(),
+									cpuLimit:    cpu200m.MilliValue(),
+								},
+								currentContainerResources: &containerResources{
 									memoryLimit: mem100M.Value(),
 									cpuLimit:    cpu100m.MilliValue(),
 								},
+							},
+						},
+					},
+					UpdatePodLevelResources: true,
+				}
+				return &pa
+			},
+			podLevelResizeEnabled: true,
+		},
+		"Update pod-level limits and container updated by default": {
+			setupFn: func(pod *v1.Pod) {
+				c0 := &pod.Spec.Containers[0]
+				c0.Resources = v1.ResourceRequirements{
+					Limits: v1.ResourceList{v1.ResourceCPU: cpu100m, v1.ResourceMemory: mem100M},
+				}
+				setupActuatedResources(pod, c0, v1.ResourceRequirements{
+					Limits: v1.ResourceList{
+						v1.ResourceCPU:    cpu100m.DeepCopy(),
+						v1.ResourceMemory: mem100M.DeepCopy(),
+					},
+				})
+				// no resources set for c1 container
+				c2 := &pod.Spec.Containers[2]
+				c2.Resources = v1.ResourceRequirements{
+					Limits: v1.ResourceList{v1.ResourceCPU: cpu100m, v1.ResourceMemory: mem100M},
+				}
+				setupActuatedResources(pod, c2, v1.ResourceRequirements{
+					Limits: v1.ResourceList{
+						v1.ResourceCPU:    cpu100m.DeepCopy(),
+						v1.ResourceMemory: mem100M.DeepCopy(),
+					},
+				})
+
+				pod.Spec.Resources = &v1.ResourceRequirements{
+					Limits: v1.ResourceList{v1.ResourceCPU: cpu600m, v1.ResourceMemory: mem600M},
+				}
+				setupActuatedPodResources(pod, &v1.ResourceRequirements{
+					Limits: v1.ResourceList{
+						v1.ResourceCPU:    cpu300m.DeepCopy(),
+						v1.ResourceMemory: mem300M.DeepCopy(),
+					},
+				})
+			},
+			getExpectedPodActionsFn: func(pod *v1.Pod, podStatus *kubecontainer.PodStatus) *podActions {
+				kcs := podStatus.FindContainerStatusByName(pod.Spec.Containers[1].Name)
+				pa := podActions{
+					SandboxID:         podStatus.SandboxStatuses[0].Id,
+					ContainersToStart: []int{},
+					ContainersToKill:  getKillMap(pod, podStatus, []int{}),
+					ContainersToUpdate: map[v1.ResourceName][]containerToUpdateInfo{
+						v1.ResourceMemory: {
+							{
+								container:       &pod.Spec.Containers[1],
+								kubeContainerID: kcs.ID,
+								desiredContainerResources: containerResources{
+									memoryLimit: mem600M.Value(),
+									cpuLimit:    cpu600m.MilliValue(),
+								},
 								currentContainerResources: &containerResources{
-									memoryLimit: mem200M.Value(),
-									cpuLimit:    cpu200m.MilliValue(),
+									memoryLimit: mem300M.Value(),
+									cpuLimit:    cpu300m.MilliValue(),
+								},
+							},
+						},
+						v1.ResourceCPU: {
+							{
+								container:       &pod.Spec.Containers[1],
+								kubeContainerID: kcs.ID,
+								desiredContainerResources: containerResources{
+									memoryLimit: mem600M.Value(),
+									cpuLimit:    cpu600m.MilliValue(),
+								},
+								currentContainerResources: &containerResources{
+									memoryLimit: mem300M.Value(),
+									cpuLimit:    cpu300m.MilliValue(),
 								},
 							},
 						},

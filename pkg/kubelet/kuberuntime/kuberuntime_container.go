@@ -58,6 +58,7 @@ import (
 	"k8s.io/kubernetes/pkg/kubelet/events"
 	proberesults "k8s.io/kubernetes/pkg/kubelet/prober/results"
 	"k8s.io/kubernetes/pkg/kubelet/types"
+	kubeutil "k8s.io/kubernetes/pkg/kubelet/util"
 	"k8s.io/kubernetes/pkg/kubelet/util/format"
 	"k8s.io/kubernetes/pkg/util/tail"
 	volumeutil "k8s.io/kubernetes/pkg/volume/util"
@@ -413,9 +414,17 @@ func (m *kubeGenericRuntimeManager) updateContainerResources(ctx context.Context
 	}
 	err := m.runtimeService.UpdateContainerResources(ctx, containerID.ID, containerResources)
 	if err == nil {
-		err = m.actuatedState.SetContainerResources(pod.UID, container.Name, container.Resources)
+		err = m.setActuatedContainerResources(pod, container)
 	}
 	return err
+}
+
+func (m *kubeGenericRuntimeManager) setActuatedContainerResources(pod *v1.Pod, container *v1.Container) error {
+	containerResources := container.Resources
+	if utilfeature.DefaultFeatureGate.Enabled(features.InPlacePodLevelResourcesVerticalScaling) {
+		containerResources.Limits = kubeutil.GetLimits(&kubeutil.ResourceOpts{PodResources: pod.Spec.Resources, ContainerResources: &container.Resources})
+	}
+	return m.actuatedState.SetContainerResources(pod.UID, container.Name, containerResources)
 }
 
 func (m *kubeGenericRuntimeManager) updatePodSandboxResources(ctx context.Context, sandboxID string, pod *v1.Pod, podResources *cm.ResourceConfig) error {

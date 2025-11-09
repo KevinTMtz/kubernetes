@@ -71,6 +71,7 @@ import (
 	"k8s.io/kubernetes/pkg/kubelet/sysctl"
 	"k8s.io/kubernetes/pkg/kubelet/token"
 	"k8s.io/kubernetes/pkg/kubelet/types"
+	kubeutil "k8s.io/kubernetes/pkg/kubelet/util"
 	"k8s.io/kubernetes/pkg/kubelet/util/cache"
 	"k8s.io/kubernetes/pkg/kubelet/util/format"
 	sc "k8s.io/kubernetes/pkg/securitycontext"
@@ -619,13 +620,22 @@ func containerSucceeded(c *v1.Container, podStatus *kubecontainer.PodStatus) boo
 	return cStatus.State == kubecontainer.ContainerStateExited && cStatus.ExitCode == 0
 }
 
-func containerResourcesFromRequirements(requirements *v1.ResourceRequirements) containerResources {
-	return containerResources{
-		memoryLimit:   requirements.Limits.Memory().Value(),
-		memoryRequest: requirements.Requests.Memory().Value(),
-		cpuLimit:      requirements.Limits.Cpu().MilliValue(),
-		cpuRequest:    requirements.Requests.Cpu().MilliValue(),
+func containerResourcesFromRequirements(podRequirements, containerRequirements *v1.ResourceRequirements) containerResources {
+	resources := containerResources{
+		memoryLimit:   containerRequirements.Limits.Memory().Value(),
+		memoryRequest: containerRequirements.Requests.Memory().Value(),
+		cpuLimit:      containerRequirements.Limits.Cpu().MilliValue(),
+		cpuRequest:    containerRequirements.Requests.Cpu().MilliValue(),
 	}
+
+	if !utilfeature.DefaultFeatureGate.Enabled(features.InPlacePodLevelResourcesVerticalScaling) {
+		return resources
+	}
+
+	containerLimits := kubeutil.GetLimits(&kubeutil.ResourceOpts{PodResources: podRequirements, ContainerResources: containerRequirements})
+	resources.memoryLimit = containerLimits.Memory().Value()
+	resources.cpuLimit = containerLimits.Cpu().MilliValue()
+	return resources
 }
 
 func podResourcesFromRequirements(requirements *v1.ResourceRequirements) podLevelResources {
@@ -665,7 +675,7 @@ func (m *kubeGenericRuntimeManager) computePodResizeAction(ctx context.Context, 
 		return true
 	}
 
-	actuatedResources, found := m.actuatedState.GetContainerResources(pod.UID, container.Name)
+	actuatedContainerResources, found := m.actuatedState.GetContainerResources(pod.UID, container.Name)
 	if !found {
 		logger.Error(nil, "Missing actuated resource record", "pod", klog.KObj(pod), "container", container.Name)
 		// Proceed with the zero-value actuated resources. For restart NotRequired, this may
@@ -673,8 +683,13 @@ func (m *kubeGenericRuntimeManager) computePodResizeAction(ctx context.Context, 
 		// For RestartContainer, this may trigger a container restart.
 	}
 
-	desiredResources := containerResourcesFromRequirements(&container.Resources)
-	currentResources := containerResourcesFromRequirements(&actuatedResources)
+	var actuatedPodResources *v1.ResourceRequirements
+	if utilfeature.DefaultFeatureGate.Enabled(features.InPlacePodLevelResourcesVerticalScaling) {
+		actuatedPodResources, _ = m.actuatedState.GetPodLevelResources(pod.UID)
+	}
+
+	desiredResources := containerResourcesFromRequirements(pod.Spec.Resources, &container.Resources)
+	currentResources := containerResourcesFromRequirements(actuatedPodResources, &actuatedContainerResources)
 
 	if currentResources == desiredResources {
 		// No resize required.
@@ -2025,6 +2040,9 @@ func (m *kubeGenericRuntimeManager) isContainerResourceResizeInProgress(allocate
 
 			actuatedResources, _ := m.actuatedState.GetContainerResources(allocatedPod.UID, allocatedContainer.Name)
 			allocatedResources := allocatedContainer.Resources
+			if utilfeature.DefaultFeatureGate.Enabled(features.InPlacePodLevelResourcesVerticalScaling) {
+				allocatedResources.Limits = kubeutil.GetLimits(&kubeutil.ResourceOpts{PodResources: allocatedPod.Spec.Resources, ContainerResources: &allocatedContainer.Resources})
+			}
 
 			return allocatedResources.Requests[v1.ResourceCPU].Equal(actuatedResources.Requests[v1.ResourceCPU]) &&
 				allocatedResources.Limits[v1.ResourceCPU].Equal(actuatedResources.Limits[v1.ResourceCPU]) &&
