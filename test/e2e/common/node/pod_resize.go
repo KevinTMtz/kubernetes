@@ -60,6 +60,9 @@ const (
 )
 
 func offsetCPU(index int, value string) string {
+	if value == "" {
+		return ""
+	}
 	val := resource.MustParse(value)
 	ptr := &val
 	ptr.Add(resource.MustParse(fmt.Sprintf("%dm", 2*index)))
@@ -67,6 +70,9 @@ func offsetCPU(index int, value string) string {
 }
 
 func offsetMemory(index int64, value string) string {
+	if value == "" {
+		return ""
+	}
 	val := resource.MustParse(value)
 	ptr := &val
 	ptr.Add(resource.MustParse(fmt.Sprintf("%dMi", 2*index)))
@@ -110,7 +116,7 @@ func doGuaranteedPodResizeTests(f *framework.Framework) {
 				expectedContainers[i] = c
 			}
 
-			doPatchAndRollback(ctx, f, originalContainers, expectedContainers, nil, nil, true)
+			doPatchAndRollback(ctx, f, originalContainers, expectedContainers, nil, nil, true, false)
 		},
 			// All tests will perform the requested resize, and once completed, will roll back the change.
 			// This results in the coverage of both increase and decrease of resources.
@@ -158,7 +164,7 @@ func doGuaranteedPodResizeTests(f *framework.Framework) {
 				},
 			}
 
-			doPatchAndRollback(ctx, f, originalContainers, expectedContainers, nil, nil, true)
+			doPatchAndRollback(ctx, f, originalContainers, expectedContainers, nil, nil, true, false)
 		})
 
 		/*
@@ -188,7 +194,7 @@ func doGuaranteedPodResizeTests(f *framework.Framework) {
 				},
 			}
 
-			doPatchAndRollback(ctx, f, originalContainers, expectedContainers, nil, nil, true)
+			doPatchAndRollback(ctx, f, originalContainers, expectedContainers, nil, nil, true, false)
 		})
 
 		/*
@@ -218,7 +224,7 @@ func doGuaranteedPodResizeTests(f *framework.Framework) {
 				},
 			}
 
-			doPatchAndRollback(ctx, f, originalContainers, expectedContainers, nil, nil, true)
+			doPatchAndRollback(ctx, f, originalContainers, expectedContainers, nil, nil, true, false)
 		})
 	})
 }
@@ -248,7 +254,7 @@ func doBurstablePodResizeTests(f *framework.Framework) {
 				expectedContainers[i] = c
 			}
 
-			doPatchAndRollback(ctx, f, originalContainers, expectedContainers, nil, nil, true)
+			doPatchAndRollback(ctx, f, originalContainers, expectedContainers, nil, nil, true, false)
 		},
 			// All tests will perform the requested resize, and once completed, will roll back the change.
 			// This results in the coverage of both increase and decrease of resources.
@@ -333,7 +339,7 @@ func doBurstablePodResizeTests(f *framework.Framework) {
 					Resources: &cgroups.ContainerResources{CPUReq: originalCPU, MemReq: increasedMem},
 				},
 			}
-			doPatchAndRollback(ctx, f, originalContainers, expectedContainers, nil, nil, false)
+			doPatchAndRollback(ctx, f, originalContainers, expectedContainers, nil, nil, false, false)
 		})
 
 		/*
@@ -354,7 +360,7 @@ func doBurstablePodResizeTests(f *framework.Framework) {
 					Resources: &cgroups.ContainerResources{CPUReq: "1m", CPULim: "5m"},
 				},
 			}
-			doPatchAndRollback(ctx, f, originalContainers, expectedContainers, nil, nil, true)
+			doPatchAndRollback(ctx, f, originalContainers, expectedContainers, nil, nil, true, false)
 		})
 	})
 }
@@ -366,7 +372,7 @@ func doPodResizePatchErrorTests(f *framework.Framework) {
 
 		ginkgo.By("creating and verifying pod")
 		if waitForStart {
-			newPod = createAndVerifyPod(ctx, f, podClient, originalContainers, nil)
+			newPod = createAndVerifyPod(ctx, f, podClient, originalContainers, nil, false)
 		} else {
 			tStamp := strconv.Itoa(time.Now().Nanosecond())
 			testPod := podresize.MakePodWithResizableContainers(f.Namespace.Name, "testpod", tStamp, originalContainers, nil)
@@ -613,7 +619,7 @@ func doPodResizeMemoryLimitDecreaseTest(f *framework.Framework) {
 		}}
 
 		ginkgo.By("creating and verifying pod")
-		testPod := createAndVerifyPod(ctx, f, podClient, original, nil)
+		testPod := createAndVerifyPod(ctx, f, podClient, original, nil, false)
 
 		// 1. Decrease the limit a little bit - should succeed
 		ginkgo.By("Patching pod with a slightly lowered memory limit")
@@ -735,7 +741,7 @@ func doPodResizeReadAndReplaceTests(f *framework.Framework) {
 		}
 
 		ginkgo.By("creating and verifying pod")
-		pod := createAndVerifyPod(ctx, f, podClient, original, nil)
+		pod := createAndVerifyPod(ctx, f, podClient, original, nil, false)
 		gomega.Expect(pod.Generation).To(gomega.BeEquivalentTo(1))
 
 		podToUpdate, err := podClient.Get(ctx, pod.Name, metav1.GetOptions{})
@@ -801,7 +807,7 @@ func doPodResizeReadAndReplaceTests(f *framework.Framework) {
 //	   b) api-server in services doesn't start with --enable-admission-plugins=ResourceQuota
 //	      and is not possible to start it from TEST_ARGS
 //	Above tests in test/e2e/node/pod_resize.go
-var _ = SIGDescribe("Pod InPlace Resize Container", func() {
+var _ = SIGDescribe("Pod InPlace Resize", func() {
 	f := framework.NewDefaultFramework("pod-resize-tests")
 
 	ginkgo.BeforeEach(func(ctx context.Context) {
@@ -819,11 +825,12 @@ var _ = SIGDescribe("Pod InPlace Resize Container", func() {
 	doPodResizeMemoryLimitDecreaseTest(f)
 })
 
-func doPatchAndRollback(ctx context.Context, f *framework.Framework, originalContainers, expectedContainers []podresize.ResizableContainerInfo, originalPodResources, expectedPodResources *v1.ResourceRequirements, doRollback bool) {
+func doPatchAndRollback(ctx context.Context, f *framework.Framework, originalContainers, expectedContainers []podresize.ResizableContainerInfo, originalPodResources, expectedPodResources *v1.ResourceRequirements, doRollback bool, mountPodCgroup bool) {
 	ginkgo.By("creating and verifying pod")
 	podClient := e2epod.NewPodClient(f)
-	newPod := createAndVerifyPod(ctx, f, podClient, originalContainers, originalPodResources)
+	newPod := createAndVerifyPod(ctx, f, podClient, originalContainers, originalPodResources, mountPodCgroup)
 
+	// framework.ExpectNoError(VerifyPodLevelStatus(newPod))
 	ginkgo.By("patching and verifying pod for resize")
 	patchAndVerify(ctx, f, podClient, newPod, originalContainers, expectedContainers, originalPodResources, expectedPodResources, "resize")
 	if doRollback {
@@ -848,19 +855,33 @@ func patchAndVerify(ctx context.Context, f *framework.Framework, podClient *e2ep
 	podresize.VerifyPodResources(patchedPod, expected, expectedPodResources)
 	resizedPod := podresize.WaitForPodResizeActuation(ctx, f, podClient, newPod, expected)
 	podresize.ExpectPodResized(ctx, f, resizedPod, expected)
+	// framework.ExpectNoError(VerifyPodLevelStatus(resizedPod))
+	if expectedPodResources != nil {
+		framework.ExpectNoError(podresize.VerifyPodCgroupValues(ctx, f, resizedPod))
+	}
 }
 
-func createAndVerifyPod(ctx context.Context, f *framework.Framework, podClient *e2epod.PodClient, originalContainers []podresize.ResizableContainerInfo, podResources *v1.ResourceRequirements) *v1.Pod {
+func createAndVerifyPod(ctx context.Context, f *framework.Framework, podClient *e2epod.PodClient, originalContainers []podresize.ResizableContainerInfo, podResources *v1.ResourceRequirements, mountPodCgroup bool) *v1.Pod {
 	tStamp := strconv.Itoa(time.Now().Nanosecond())
 	testPod := podresize.MakePodWithResizableContainers(f.Namespace.Name, "", tStamp, originalContainers, podResources)
 	testPod.GenerateName = "resize-test-"
 	testPod = e2epod.MustMixinRestrictedPodSecurity(testPod)
+
+	// TODO: mount pod cgroup path for all pod resize related tests and remove
+	// dependency on mountPodCgroup
+	if mountPodCgroup {
+		// mount pod cgroup in first container that can be used for pod cgroup values verification
+		cgroups.ConfigureHostPathForPodCgroup(testPod)
+	}
+
 	newPod := podClient.CreateSync(ctx, testPod)
 	podresize.VerifyPodResources(newPod, originalContainers, podResources)
 	podresize.VerifyPodResizePolicy(newPod, originalContainers)
 	framework.ExpectNoError(podresize.VerifyPodStatusResources(newPod, originalContainers))
 	framework.ExpectNoError(podresize.VerifyPodContainersCgroupValues(ctx, f, newPod, originalContainers))
-
+	if podResources != nil {
+		framework.ExpectNoError(podresize.VerifyPodCgroupValues(ctx, f, newPod))
+	}
 	return newPod
 }
 
@@ -935,3 +956,42 @@ func createRollbackContainers(originalContainers, expectedContainers []podresize
 	}
 	return rollbackContainers
 }
+
+/*
+[FAILED] [20.181 seconds]
+[sig-node] Pod InPlace Resize [Feature:InPlacePodLevelResourcesVerticalScaling] [FeatureGate:InPlacePodLevelResourcesVerticalScaling] [Alpha] [Feature:OffByDefault] pod-level burstable pods - 1 container with all requests & limits set and resize policy mem restart resizing [It] pod-level cpu & mem in opposite directions [sig-node, Feature:InPlacePodLevelResourcesVerticalScaling, FeatureGate:InPlacePodLevelResourcesVerticalScaling, Alpha, Feature:OffByDefault]
+k8s.io/kubernetes/test/e2e/common/node/pod_level_resources_resize.go:246
+
+  [FAILED] [pod.status.allocatedResources mismatch: Expected object to be comparable, diff:   v1.ResourceList{
+  - 	s"cpu":    {i: resource.int64Amount{value: 80, scale: -3}, s: "80m", Format: "DecimalSI"},
+  + 	s"cpu":    {i: resource.int64Amount{value: 85, scale: -3}, s: "85m", Format: "DecimalSI"},
+  - 	s"memory": {i: resource.int64Amount{value: 83886080}, Format: "BinarySI"},
+  + 	s"memory": {i: resource.int64Amount{value: 78643200}, s: "75Mi", Format: "BinarySI"},
+    }
+  , pod.status.resources mismatch: Expected object to be comparable, diff:   &v1.ResourceRequirements{
+    	Limits: v1.ResourceList{
+  - 		s"cpu":    {i: resource.int64Amount{value: 90, scale: -3}, s: "90m", Format: "DecimalSI"},
+  + 		s"cpu":    {i: resource.int64Amount{value: 95, scale: -3}, s: "95m", Format: "DecimalSI"},
+  - 		s"memory": {i: resource.int64Amount{value: 94371840}, s: "90Mi", Format: "BinarySI"},
+  + 		s"memory": {i: resource.int64Amount{value: 89128960}, s: "85Mi", Format: "BinarySI"},
+    	},
+    	Requests: v1.ResourceList{
+  - 		s"cpu":    {i: resource.int64Amount{value: 80, scale: -3}, s: "80m", Format: "DecimalSI"},
+  + 		s"cpu":    {i: resource.int64Amount{value: 85, scale: -3}, s: "85m", Format: "DecimalSI"},
+  - 		s"memory": {i: resource.int64Amount{value: 83886080}, Format: "BinarySI"},
+  + 		s"memory": {i: resource.int64Amount{value: 78643200}, s: "75Mi", Format: "BinarySI"},
+    	},
+    	Claims: nil,
+    }
+  ]
+  In [It] at: k8s.io/kubernetes/test/e2e/common/node/pod_resize.go:852 @ 11/10/25 11:25:53.515
+------------------------------
+SSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSS
+------------------------------
+[sig-node] Pod InPlace Resize [Feature:InPlacePodLevelResourcesVerticalScaling]
+[FeatureGate:InPlacePodLevelResourcesVerticalScaling] [Alpha] [Feature:OffByDefault]
+pod-level burstable pods - 1 container with all requests & limits set and resize
+policy cpu & mem restart resizing pod-level mem requests [sig-node,
+Feature:InPlacePodLevelResourcesVerticalScaling,
+FeatureGate:InPlacePodLevelResourcesVerticalScaling, Alpha, Feature:OffByDefault]
+*/

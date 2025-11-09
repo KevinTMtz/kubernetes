@@ -223,20 +223,60 @@ func verifyPodContainersStatusResources(gotCtrStatuses []v1.ContainerStatus, wan
 }
 
 func VerifyPodCgroupValues(ctx context.Context, f *framework.Framework, pod *v1.Pod) error {
-	podResources := pod.Spec.Resources
-	if podResources == nil {
-		return nil
+	aggregatedReqs, aggregatedLims := AggregateContainerResources(pod.Spec)
+	cpuReq := aggregatedReqs[v1.ResourceCPU]
+	cpuLim := aggregatedLims[v1.ResourceCPU]
+	memLim := aggregatedLims[v1.ResourceMemory]
+	if pod.Spec.Resources != nil {
+		cpuReq = pod.Spec.Resources.Requests[v1.ResourceCPU]
+		if pod.Spec.Resources.Limits != nil {
+			if podCPULim, found := pod.Spec.Resources.Limits[v1.ResourceCPU]; found {
+				cpuLim = podCPULim
+			}
+			if podMemLim, found := pod.Spec.Resources.Limits[v1.ResourceMemory]; found {
+				memLim = podMemLim
+			}
+		}
 	}
-	cpuReq := podResources.Requests[v1.ResourceCPU]
-	memLim := podResources.Limits[v1.ResourceMemory]
-	cpuLim := podResources.Limits[v1.ResourceCPU]
+
 	cgroupResources := &cgroups.ContainerResources{
 		CPUReq: cpuReq.String(),
 		MemLim: memLim.String(),
 		CPULim: cpuLim.String(),
+		// memory requests are not set in cgroup
 	}
 
 	return cgroups.VerifyPodCgroups(ctx, f, pod, cgroupResources)
+}
+
+func AggregateContainerResources(spec v1.PodSpec) (v1.ResourceList, v1.ResourceList) {
+	// Pre-allocate map memory based on the test's scope, as only
+	// 'cpu' and 'memory' resources will be tracked.
+	aggregatedReqs := make(v1.ResourceList, 2)
+	aggregatedLims := make(v1.ResourceList, 2)
+
+	for _, container := range spec.Containers {
+		addResourceList(aggregatedReqs, container.Resources.Requests)
+		addResourceList(aggregatedLims, container.Resources.Limits)
+	}
+
+	for _, container := range spec.InitContainers {
+		addResourceList(aggregatedReqs, container.Resources.Requests)
+		addResourceList(aggregatedLims, container.Resources.Limits)
+	}
+
+	return aggregatedReqs, aggregatedLims
+}
+
+// TODO: move this to a common helper method and re-use in pod-level resources
+// related tests
+func addResourceList(des, src v1.ResourceList) {
+	for name, quantity := range src {
+		if value, found := des[name]; found {
+			quantity.Add(value)
+		}
+		des[name] = quantity.DeepCopy()
+	}
 }
 
 func VerifyPodContainersCgroupValues(ctx context.Context, f *framework.Framework, pod *v1.Pod, tcInfo []ResizableContainerInfo) error {
@@ -353,6 +393,7 @@ func ExpectPodResized(ctx context.Context, f *framework.Framework, resizedPod *v
 
 	// Verify Pod Containers Cgroup Values
 	var errs []error
+
 	if cgroupErrs := VerifyPodContainersCgroupValues(ctx, f, resizedPod, expectedContainers); cgroupErrs != nil {
 		errs = append(errs, fmt.Errorf("container cgroup values don't match expected: %w", formatErrors(cgroupErrs)))
 	}
