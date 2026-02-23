@@ -97,16 +97,35 @@ func (m *fakeManager) GetAllocatableCPUs() cpuset.CPUSet {
 
 func (m *fakeManager) GetCPUAffinity(podUID, containerName string) cpuset.CPUSet {
 	m.logger.Info("GetCPUAffinity", "podUID", podUID, "containerName", containerName)
-	return cpuset.CPUSet{}
+	// Try to get specific container assignment first.
+	// If none exists, fall back to the pod-level pool (pod assignment).
+	// This fallback is critical for the pod-level isolation model, ensuring unassigned
+	// containers (like ephemeral containers) stay within the pod's hardware boundary.
+	if cpuSet, ok := m.state.GetPodCPUSet(podUID); ok {
+		if cset, ok := m.state.GetCPUAssignments()[podUID][containerName]; ok {
+			return cset
+		}
+		return cpuSet
+	}
+	return m.state.GetCPUSetOrDefault(podUID, containerName)
 }
 
 func (m *fakeManager) GetAllCPUs() cpuset.CPUSet {
 	m.logger.Info("GetAllCPUs")
-	return cpuset.CPUSet{}
+	return m.state.GetDefaultCPUSet()
 }
 
 func (m *fakeManager) GetResourceIsolationLevel(pod *v1.Pod, container *v1.Container) cmqos.ResourceIsolationLevel {
+	// If the container has no specific affinity assigned, it defaults to the pod-level isolation.
+	if _, ok := m.state.GetCPUSet(string(pod.UID), container.Name); !ok {
+		return cmqos.ResourceIsolationHost
+	}
 	return cmqos.ResourceIsolationContainer
+}
+
+// GetPodCPUSet returns the CPUSet allocated to the pod as a whole (the pod-level pool).
+func (m *fakeManager) GetPodCPUSet(podUID string) cpuset.CPUSet {
+	return cpuset.CPUSet{}
 }
 
 // NewFakeManager creates empty/fake cpu manager

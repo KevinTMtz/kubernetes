@@ -95,6 +95,10 @@ type Manager interface {
 
 	// GetMemory returns the memory allocated by a container from NUMA nodes
 	GetMemory(podUID, containerName string) []state.Block
+
+	// GetPodMemoryNodes returns the memory allocated to the pod as a whole.
+	// Returns nil if the pod is not managed at pod-level.
+	GetPodMemoryNodes(podUID string) []state.Block
 }
 
 type manager struct {
@@ -245,9 +249,19 @@ func (m *manager) AddContainer(logger klog.Logger, pod *v1.Pod, container *v1.Co
 func (m *manager) GetMemoryNUMANodes(logger klog.Logger, pod *v1.Pod, container *v1.Container) sets.Set[int] {
 	logger = klog.LoggerWithValues(logger, "pod", klog.KObj(pod), "containerName", container.Name)
 
+	podUID := string(pod.UID)
 	// Get NUMA node affinity of blocks assigned to the container during Allocate()
 	numaNodes := sets.New[int]()
-	for _, block := range m.state.GetMemoryBlocks(string(pod.UID), container.Name) {
+
+	blocks := m.state.GetMemoryBlocks(podUID, container.Name)
+	if len(blocks) == 0 {
+		// If the container doesn't have an exclusive assignment (e.g. init, sidecar, debug containers),
+		// check if the pod has a pod-level assignment. If so, return the pod's entire allocated NUMA memory nodes.
+		// This keeps these containers restricted to the pod's isolated domain.
+		blocks = m.state.GetPodMemoryBlocks(podUID)
+	}
+
+	for _, block := range blocks {
 		for _, nodeID := range block.NUMAAffinity {
 			// avoid nodes duplication when hugepages and memory blocks pinned to the same NUMA node
 			numaNodes.Insert(nodeID)
@@ -493,4 +507,8 @@ func (m *manager) GetAllocatableMemory() []state.Block {
 // GetMemory returns the memory allocated by a container from NUMA nodes
 func (m *manager) GetMemory(podUID, containerName string) []state.Block {
 	return m.state.GetMemoryBlocks(podUID, containerName)
+}
+
+func (m *manager) GetPodMemoryNodes(podUID string) []state.Block {
+	return m.state.GetPodMemoryBlocks(podUID)
 }

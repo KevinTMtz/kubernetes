@@ -24,13 +24,14 @@ import (
 	"context"
 
 	mock "github.com/stretchr/testify/mock"
-	"k8s.io/api/core/v1"
+	v1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apiserver/pkg/server/healthz"
-	"k8s.io/cri-api/pkg/apis"
+	cri "k8s.io/cri-api/pkg/apis"
 	"k8s.io/klog/v2"
 	v10 "k8s.io/kubelet/pkg/apis/podresources/v1"
 	"k8s.io/kubernetes/pkg/kubelet/cm"
+	"k8s.io/kubernetes/pkg/kubelet/cm/memorymanager/state"
 	"k8s.io/kubernetes/pkg/kubelet/cm/resourceupdates"
 	"k8s.io/kubernetes/pkg/kubelet/config"
 	"k8s.io/kubernetes/pkg/kubelet/container"
@@ -38,6 +39,7 @@ import (
 	"k8s.io/kubernetes/pkg/kubelet/pluginmanager/cache"
 	"k8s.io/kubernetes/pkg/kubelet/status"
 	"k8s.io/kubernetes/pkg/scheduler/framework"
+	"k8s.io/utils/cpuset"
 )
 
 // NewMockContainerManager creates a new instance of MockContainerManager. It also registers a testing interface on the mock and a cleanup function to assert the mocks expectations.
@@ -138,6 +140,46 @@ func (_mock *MockContainerManager) GetAllocatableCPUs() []int64 {
 	} else {
 		if ret.Get(0) != nil {
 			r0 = ret.Get(0).([]int64)
+		}
+	}
+	return r0
+}
+
+// GetPodCPUSet provides a mock function to retrieve the pod-level CPUSet (pod-level pool).
+// This is used in tests to verify that the parent pod cgroup is correctly restricted,
+// ensuring unassigned containers inherit these hardware boundaries.
+func (_mock *MockContainerManager) GetPodCPUSet(podUID string) cpuset.CPUSet {
+	ret := _mock.Called(podUID)
+
+	if len(ret) == 0 {
+		panic("no return value specified for GetPodCPUSet")
+	}
+
+	var r0 cpuset.CPUSet
+	if returnFunc, ok := ret.Get(0).(func(string) cpuset.CPUSet); ok {
+		r0 = returnFunc(podUID)
+	} else {
+		r0 = ret.Get(0).(cpuset.CPUSet)
+	}
+	return r0
+}
+
+// GetPodMemoryNodes provides a mock function to retrieve the pod-level memory NUMA nodes (pod-level pool).
+// This is used in tests to verify that the parent pod cgroup is correctly restricted,
+// ensuring unassigned containers inherit these hardware boundaries.
+func (_mock *MockContainerManager) GetPodMemoryNodes(podUID string) []state.Block {
+	ret := _mock.Called(podUID)
+
+	if len(ret) == 0 {
+		panic("no return value specified for GetPodMemoryNodes")
+	}
+
+	var r0 []state.Block
+	if returnFunc, ok := ret.Get(0).(func(string) []state.Block); ok {
+		r0 = returnFunc(podUID)
+	} else {
+		if ret.Get(0) != nil {
+			r0 = ret.Get(0).([]state.Block)
 		}
 	}
 	return r0

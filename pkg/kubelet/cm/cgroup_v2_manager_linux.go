@@ -29,12 +29,15 @@ import (
 	"k8s.io/apimachinery/pkg/util/sets"
 	"k8s.io/klog/v2"
 	cmutil "k8s.io/kubernetes/pkg/kubelet/cm/util"
+	"k8s.io/utils/cpuset"
 )
 
 const (
-	cgroupv2MemLimitFile  = "memory.max"
-	cgroupv2CpuMaxFile    = "cpu.max"
-	cgroupv2CpuWeightFile = "cpu.weight"
+	cgroupv2MemLimitFile   = "memory.max"
+	cgroupv2CpuMaxFile     = "cpu.max"
+	cgroupv2CpuWeightFile  = "cpu.weight"
+	cgroupv2CpusetCpusFile = "cpuset.cpus"
+	cgroupv2CpusetMemsFile = "cpuset.mems"
 )
 
 // cgroupV2impl implements the CgroupManager interface
@@ -130,7 +133,20 @@ func (c *cgroupV2impl) getCgroupCPUConfig(cgroupPath string) (*ResourceConfig, e
 		return nil, fmt.Errorf("failed to read CPU weight for cgroup %v: %w", cgroupPath, errWeight)
 	}
 	cpuShares := cpuWeightToCPUShares(cpuWeight)
-	return &ResourceConfig{CPUShares: &cpuShares, CPUQuota: &cpuLimit, CPUPeriod: &cpuPeriod}, nil
+
+	resConfig := &ResourceConfig{CPUShares: &cpuShares, CPUQuota: &cpuLimit, CPUPeriod: &cpuPeriod}
+
+	// It is crucial to preserve the pod's existing hardware isolation boundary (cpuset.cpus, cpuset.mems).
+	// If we don't read and preserve this state, operations like SyncPod can inadvertently clobber
+	// these boundaries, allowing containers (like ephemeral debug containers) to break out of the pod-level pool.
+	if cpusetCpus, err := fscommon.GetCgroupParamString(cgroupPath, cgroupv2CpusetCpusFile); err == nil {
+		resConfig.CPUSet, _ = cpuset.Parse(strings.TrimSpace(cpusetCpus))
+	}
+	if cpusetMems, err := fscommon.GetCgroupParamString(cgroupPath, cgroupv2CpusetMemsFile); err == nil {
+		resConfig.MemoryNodes, _ = cpuset.Parse(strings.TrimSpace(cpusetMems))
+	}
+
+	return resConfig, nil
 }
 
 func (c *cgroupV2impl) getCgroupMemoryConfig(cgroupPath string) (*ResourceConfig, error) {

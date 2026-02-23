@@ -53,6 +53,8 @@ import (
 	netutils "k8s.io/utils/net"
 	"k8s.io/utils/ptr"
 
+	"k8s.io/utils/cpuset"
+
 	v1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -2105,10 +2107,41 @@ func (kl *Kubelet) SyncPod(ctx context.Context, updateType kubetypes.SyncPodType
 					kl.recorder.Eventf(pod, v1.EventTypeWarning, events.FailedToCreatePodContainer, "unable to ensure pod container exists: %v", err)
 					return false, fmt.Errorf("failed to ensure that the pod: %v cgroups exist and are correctly applied: %v", pod.UID, err)
 				}
+			}
 
-				if err = kl.containerRuntime.UpdateActuatedPodLevelResources(pod); err != nil {
-					return false, fmt.Errorf("failed to update the state of pod-level resources for the pod %v : %w", pod.UID, err)
+			if utilfeature.DefaultFeatureGate.Enabled(features.PodLevelResourceManagers) {
+				// Retrieve the total hardware allocation for the pod from the managers.
+				// This allocation forms the pod-level pool that restricts all processes in the pod.
+				podCPUs := kl.containerManager.GetPodCPUSet(string(pod.UID))
+				podMemory := kl.containerManager.GetPodMemoryNodes(string(pod.UID))
+				if !podCPUs.IsEmpty() || len(podMemory) > 0 {
+					// Read the existing pod cgroup configuration.
+					resourceConfig, err := pcm.GetPodCgroupConfig(pod, v1.ResourceCPU)
+					if err != nil {
+						resourceConfig = &cm.ResourceConfig{}
+					}
+					// Apply the CPUSet (cores) isolation.
+					resourceConfig.CPUSet = podCPUs
+
+					// Apply the NUMA nodes isolation.
+					if len(podMemory) > 0 {
+						var nodeIDs []int
+						for _, block := range podMemory {
+							nodeIDs = append(nodeIDs, block.NUMAAffinity...)
+						}
+						resourceConfig.MemoryNodes = cpuset.New(nodeIDs...)
+					}
+					// Enforce the hardware isolation boundary on the parent pod.slice.
+					// This ensures that any container (including dynamic ephemeral containers)
+					// spawned within this cgroup automatically inherits these restrictions.
+					if err := pcm.SetPodCgroupConfig(klog.TODO(), pod, resourceConfig); err != nil {
+						klog.ErrorS(err, "Failed to apply hardware isolation to pod cgroup", "pod", klog.KObj(pod))
+					}
 				}
+			}
+
+			if err = kl.containerRuntime.UpdateActuatedPodLevelResources(pod); err != nil {
+				return false, fmt.Errorf("failed to update the state of pod-level resources for the pod %v : %w", pod.UID, err)
 			}
 		}
 	}

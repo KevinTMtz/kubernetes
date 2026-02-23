@@ -32,6 +32,7 @@ import (
 	runtimeapi "k8s.io/cri-api/pkg/apis/runtime/v1"
 	"k8s.io/klog/v2"
 
+	"k8s.io/kubernetes/pkg/features"
 	kubefeatures "k8s.io/kubernetes/pkg/features"
 	"k8s.io/kubernetes/pkg/kubelet/cm/containermap"
 	"k8s.io/kubernetes/pkg/kubelet/cm/cpumanager/state"
@@ -110,6 +111,10 @@ type Manager interface {
 
 	// GetResourceIsolationLevel returns the isolation level of the container.
 	GetResourceIsolationLevel(pod *v1.Pod, container *v1.Container) cmqos.ResourceIsolationLevel
+
+	// GetPodCPUSet returns the CPUSet allocated to the pod as a whole.
+	// Returns empty set if the pod is not managed at pod-level.
+	GetPodCPUSet(podUID string) cpuset.CPUSet
 }
 
 type manager struct {
@@ -509,7 +514,7 @@ func (m *manager) reconcileState(ctx context.Context) (success []reconciledConta
 			m.containerMap.Add(string(pod.UID), container.Name, containerID)
 			m.Unlock()
 
-			cset := m.state.GetCPUSetOrDefault(string(pod.UID), container.Name)
+			cset := m.GetCPUAffinity(string(pod.UID), container.Name)
 			if cset.IsEmpty() {
 				// NOTE: This should not happen outside of tests.
 				logger.V(2).Info("ReconcileState: skipping container; empty cpuset assigned")
@@ -568,6 +573,19 @@ func (m *manager) GetExclusiveCPUs(podUID, containerName string) cpuset.CPUSet {
 }
 
 func (m *manager) GetCPUAffinity(podUID, containerName string) cpuset.CPUSet {
+	if utilfeature.DefaultFeatureGate.Enabled(features.PodLevelResourceManagers) {
+		if cpuSet, ok := m.state.GetPodCPUSet(podUID); ok {
+			// If the container has an exclusive assignment, use its specific cores.
+			if cset, ok := m.state.GetCPUAssignments()[podUID][containerName]; ok {
+				return cset
+			}
+			// If the pod is managed at the pod-level but the container doesn't have an exclusive
+			// assignment (e.g., it's an init container, sidecar, or ephemeral debug container),
+			// fallback to returning the pod's entire allocated CPUSet (the pod-level pool).
+			// This prevents these containers from escaping to the node's shared pool.
+			return cpuSet
+		}
+	}
 	return m.state.GetCPUSetOrDefault(podUID, containerName)
 }
 
@@ -590,4 +608,9 @@ func (m *manager) GetResourceIsolationLevel(pod *v1.Pod, container *v1.Container
 	}
 
 	return cmqos.ResourceIsolationContainer
+}
+
+func (m *manager) GetPodCPUSet(podUID string) cpuset.CPUSet {
+	cpuSet, _ := m.state.GetPodCPUSet(podUID)
+	return cpuSet
 }

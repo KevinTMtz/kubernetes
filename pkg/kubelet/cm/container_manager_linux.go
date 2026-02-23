@@ -30,6 +30,7 @@ import (
 	"github.com/opencontainers/cgroups/manager"
 	"k8s.io/klog/v2"
 	"k8s.io/mount-utils"
+	"k8s.io/utils/cpuset"
 	utilpath "k8s.io/utils/path"
 
 	inuserns "github.com/moby/sys/userns"
@@ -1138,6 +1139,20 @@ func (cm *containerManagerImpl) UpdateAllocatedResourcesStatus(pod *v1.Pod, stat
 			cm.draManager.UpdateAllocatedResourcesStatus(pod, status)
 		}
 	}
+}
+
+// GetPodCPUSet returns the CPUSet allocated to the pod as a whole (the pod-level pool).
+// This is used to restrict the parent pod cgroup, ensuring that any unassigned
+// containers (like ephemeral debug containers) are isolated within this pool.
+func (cm *containerManagerImpl) GetPodCPUSet(podUID string) cpuset.CPUSet {
+	return cm.cpuManager.GetPodCPUSet(podUID)
+}
+
+// GetPodMemoryNodes returns the memory NUMA nodes allocated to the pod as a whole (the pod-level pool).
+// This is used to restrict the parent pod cgroup, ensuring that any unassigned
+// containers (like ephemeral debug containers) are isolated within these nodes.
+func (cm *containerManagerImpl) GetPodMemoryNodes(podUID string) []memorymanagerstate.Block {
+	return cm.memoryManager.GetPodMemoryNodes(podUID)
 }
 
 func (cm *containerManagerImpl) Updates() <-chan resourceupdates.Update {

@@ -22,6 +22,7 @@ import (
 
 	v1 "k8s.io/api/core/v1"
 	"k8s.io/klog/v2"
+	"k8s.io/utils/cpuset"
 
 	"k8s.io/apimachinery/pkg/api/resource"
 	"k8s.io/apimachinery/pkg/types"
@@ -30,6 +31,7 @@ import (
 	podresourcesapi "k8s.io/kubelet/pkg/apis/podresources/v1"
 	"k8s.io/kubernetes/pkg/kubelet/cm/cpumanager"
 	"k8s.io/kubernetes/pkg/kubelet/cm/memorymanager"
+	memorymanagerstate "k8s.io/kubernetes/pkg/kubelet/cm/memorymanager/state"
 	"k8s.io/kubernetes/pkg/kubelet/cm/resourceupdates"
 	"k8s.io/kubernetes/pkg/kubelet/cm/topologymanager"
 	"k8s.io/kubernetes/pkg/kubelet/config"
@@ -294,4 +296,16 @@ func (cm *FakeContainerManager) PodHasExclusiveCPUs(pod *v1.Pod) bool {
 
 func (cm *FakeContainerManager) ContainerHasExclusiveCPUs(pod *v1.Pod, container *v1.Container) bool {
 	return false
+}
+
+func (cm *FakeContainerManager) GetPodCPUSet(podUID string) cpuset.CPUSet {
+	cm.Lock()
+	defer cm.Unlock()
+	return cpuset.CPUSet{}
+}
+
+func (cm *FakeContainerManager) GetPodMemoryNodes(podUID string) []memorymanagerstate.Block {
+	cm.Lock()
+	defer cm.Unlock()
+	return nil
 }

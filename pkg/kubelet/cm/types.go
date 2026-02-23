@@ -29,6 +29,8 @@ type ResourceConfig struct {
 	Memory *int64
 	// CPU set (number of CPUs the cgroup has access to).
 	CPUSet cpuset.CPUSet
+	// Memory nodes (number of memory nodes the cgroup has access to).
+	MemoryNodes cpuset.CPUSet
 	// CPU shares (relative weight vs. other containers).
 	CPUShares *uint64
 	// CPU hardcap limit (in usecs). Allowed cpu time in a given period.

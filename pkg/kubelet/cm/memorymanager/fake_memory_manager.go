@@ -56,7 +56,25 @@ func (m *fakeManager) AddContainer(logger klog.Logger, pod *v1.Pod, container *v
 
 func (m *fakeManager) GetMemoryNUMANodes(logger klog.Logger, pod *v1.Pod, container *v1.Container) sets.Set[int] {
 	logger.Info("Get MemoryNUMANodes", "pod", klog.KObj(pod), "containerName", container.Name)
-	return nil
+	podUID := string(pod.UID)
+	numaNodes := sets.New[int]()
+	// Try to get specific container blocks first.
+	// If none exists, fall back to the pod-level blocks (pod assignment).
+	// This fallback is critical for the pod-level isolation model, ensuring unassigned
+	// containers (like ephemeral containers) stay within the pod's memory NUMA boundary.
+	blocks := m.state.GetMemoryBlocks(podUID, container.Name)
+	if len(blocks) == 0 {
+		blocks = m.state.GetPodMemoryBlocks(podUID)
+	}
+	for _, block := range blocks {
+		for _, nodeID := range block.NUMAAffinity {
+			numaNodes.Insert(nodeID)
+		}
+	}
+	if numaNodes.Len() == 0 {
+		return nil
+	}
+	return numaNodes
 }
 
 func (m *fakeManager) RemoveContainer(logger klog.Logger, containerID string) error {
@@ -98,6 +116,11 @@ func (m *fakeManager) GetMemory(podUID, containerName string) []state.Block {
 	logger := klog.LoggerWithValues(klog.TODO(), "podUID", podUID, "containerName", containerName)
 	logger.Info("Get Memory")
 	return []state.Block{}
+}
+
+// GetPodMemoryNodes returns the memory NUMA nodes allocated to the pod as a whole (the pod-level pool).
+func (m *fakeManager) GetPodMemoryNodes(podUID string) []state.Block {
+	return nil
 }
 
 // NewFakeManager creates empty/fake memory manager

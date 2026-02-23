@@ -36,6 +36,7 @@ import (
 	kubeletconfig "k8s.io/kubernetes/pkg/kubelet/apis/config"
 	"k8s.io/kubernetes/pkg/kubelet/apis/podresources"
 	"k8s.io/kubernetes/pkg/kubelet/cm/devicemanager"
+	memorymanagerstate "k8s.io/kubernetes/pkg/kubelet/cm/memorymanager/state"
 	"k8s.io/kubernetes/pkg/kubelet/cm/resourceupdates"
 	"k8s.io/kubernetes/pkg/kubelet/config"
 	kubecontainer "k8s.io/kubernetes/pkg/kubelet/container"
@@ -161,6 +162,16 @@ type ContainerManager interface {
 
 	// ContainerHasExclusiveCPUs returns true if the provided container in the pod has exclusive cpu
 	ContainerHasExclusiveCPUs(pod *v1.Pod, container *v1.Container) bool
+
+	// GetPodCPUSet returns the CPUSet allocated to the pod as a whole (the pod-level pool).
+	// This is used to restrict the parent pod cgroup, ensuring that any unassigned
+	// containers (like ephemeral debug containers) are isolated within this pool.
+	GetPodCPUSet(podUID string) cpuset.CPUSet
+
+	// GetPodMemoryNodes returns the memory NUMA nodes allocated to the pod as a whole (the pod-level pool).
+	// This is used to restrict the parent pod cgroup, ensuring that any unassigned
+	// containers (like ephemeral debug containers) are isolated within these nodes.
+	GetPodMemoryNodes(podUID string) []memorymanagerstate.Block
 
 	// Implements the PodResources Provider API
 	podresources.CPUsProvider

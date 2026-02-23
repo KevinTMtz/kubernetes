@@ -27,6 +27,7 @@ import (
 	v1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/util/sets"
 	"k8s.io/klog/v2"
+	"k8s.io/utils/cpuset"
 )
 
 const cgroupv1MemLimitFile string = "memory.limit_in_bytes"
@@ -112,13 +113,39 @@ func (c *cgroupV1impl) GetCgroupConfig(name CgroupName, resource v1.ResourceName
 	if !found {
 		return nil, fmt.Errorf("failed to build %v cgroup fs path for cgroup %v", resource, name)
 	}
+
+	var resConfig *ResourceConfig
+	var err error
+
 	switch resource {
 	case v1.ResourceCPU:
-		return c.getCgroupCPUConfig(cgroupResourcePath)
+		resConfig, err = c.getCgroupCPUConfig(cgroupResourcePath)
 	case v1.ResourceMemory:
-		return c.getCgroupMemoryConfig(cgroupResourcePath)
+		resConfig, err = c.getCgroupMemoryConfig(cgroupResourcePath)
+	default:
+		return nil, fmt.Errorf("unsupported resource %v for cgroup %v", resource, name)
 	}
-	return nil, fmt.Errorf("unsupported resource %v for cgroup %v", resource, name)
+
+	if err != nil {
+		return nil, err
+	}
+
+	// For CPU requests, also try to read CPUSet and MemoryNodes if cpuset controller is enabled.
+	// It is crucial to preserve the pod's existing hardware isolation boundary (cpuset.cpus, cpuset.mems).
+	// If we don't read and preserve this state, operations like SyncPod can inadvertently clobber
+	// these boundaries, allowing containers (like ephemeral debug containers) to break out of the pod-level pool.
+	if resource == v1.ResourceCPU {
+		if cpusetPath, ok := cgroupPaths["cpuset"]; ok {
+			if cpusetCpus, err := fscommon.GetCgroupParamString(cpusetPath, "cpuset.cpus"); err == nil {
+				resConfig.CPUSet, _ = cpuset.Parse(strings.TrimSpace(cpusetCpus))
+			}
+			if cpusetMems, err := fscommon.GetCgroupParamString(cpusetPath, "cpuset.mems"); err == nil {
+				resConfig.MemoryNodes, _ = cpuset.Parse(strings.TrimSpace(cpusetMems))
+			}
+		}
+	}
+
+	return resConfig, nil
 }
 
 func (c *cgroupV1impl) getCgroupCPUConfig(cgroupPath string) (*ResourceConfig, error) {

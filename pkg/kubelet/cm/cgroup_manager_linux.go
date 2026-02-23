@@ -309,6 +309,12 @@ func (m *cgroupCommon) toResources(logger klog.Logger, resourceConfig *ResourceC
 	if !resourceConfig.CPUSet.IsEmpty() {
 		resources.CpusetCpus = resourceConfig.CPUSet.String()
 	}
+	// Apply NUMA node memory affinity to the cgroup.
+	// This is critical for the pod-level pool isolation model, ensuring all children
+	// (like ephemeral containers) inherit these hardware restrictions from the parent.
+	if !resourceConfig.MemoryNodes.IsEmpty() {
+		resources.CpusetMems = resourceConfig.MemoryNodes.String()
+	}
 
 	m.maybeSetHugetlb(logger, resourceConfig, resources)
 

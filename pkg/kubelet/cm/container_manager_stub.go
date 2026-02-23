@@ -22,6 +22,7 @@ import (
 
 	v1 "k8s.io/api/core/v1"
 	"k8s.io/klog/v2"
+	"k8s.io/utils/cpuset"
 
 	"k8s.io/apimachinery/pkg/api/resource"
 	"k8s.io/apimachinery/pkg/types"
@@ -30,6 +31,7 @@ import (
 	podresourcesapi "k8s.io/kubelet/pkg/apis/podresources/v1"
 	"k8s.io/kubernetes/pkg/kubelet/cm/cpumanager"
 	"k8s.io/kubernetes/pkg/kubelet/cm/memorymanager"
+	memorymanagerstate "k8s.io/kubernetes/pkg/kubelet/cm/memorymanager/state"
 	"k8s.io/kubernetes/pkg/kubelet/cm/resourceupdates"
 	"k8s.io/kubernetes/pkg/kubelet/cm/topologymanager"
 	"k8s.io/kubernetes/pkg/kubelet/config"
@@ -206,6 +208,18 @@ func (cm *containerManagerStub) PodHasExclusiveCPUs(pod *v1.Pod) bool {
 
 func (cm *containerManagerStub) ContainerHasExclusiveCPUs(pod *v1.Pod, container *v1.Container) bool {
 	return false
+}
+
+// GetPodCPUSet returns the CPUSet allocated to the pod as a whole (the pod-level pool).
+// This stub implementation always returns an empty CPUSet.
+func (cm *containerManagerStub) GetPodCPUSet(podUID string) cpuset.CPUSet {
+	return cpuset.CPUSet{}
+}
+
+// GetPodMemoryNodes returns the memory NUMA nodes allocated to the pod as a whole (the pod-level pool).
+// This stub implementation always returns nil.
+func (cm *containerManagerStub) GetPodMemoryNodes(podUID string) []memorymanagerstate.Block {
+	return nil
 }
 
 func NewStubContainerManager() ContainerManager {
