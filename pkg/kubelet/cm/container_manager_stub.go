@@ -161,11 +161,27 @@ func (cm *containerManagerStub) GetCPUs(_, _ string) []int64 {
 	return nil
 }
 
+func (cm *containerManagerStub) GetPodCPUs(_ string) []int64 {
+	return nil
+}
+
 func (cm *containerManagerStub) GetAllocatableCPUs() []int64 {
 	return nil
 }
 
+func (cm *containerManagerStub) GetCPUIsolationLevel(pod *v1.Pod, container *v1.Container) string {
+	return "host"
+}
+
+func (cm *containerManagerStub) GetMemoryIsolationLevel(pod *v1.Pod, container *v1.Container) string {
+	return "host"
+}
+
 func (cm *containerManagerStub) GetMemory(_, _ string) []*podresourcesapi.ContainerMemory {
+	return nil
+}
+
+func (cm *containerManagerStub) GetPodMemory(_ string) []*podresourcesapi.ContainerMemory {
 	return nil
 }
 

@@ -35,6 +35,19 @@ message PodResources {
     string name = 1;
     string namespace = 2;
     repeated ContainerResources containers = 3;
+    repeated int64 cpu_ids = 4;
+    repeated ContainerMemory memory = 5;
+}
+
+// ResourceIsolation describes how isolated the resources in this container are.
+enum ResourceIsolation {
+    // The container's resources are drawn from the node's general shared pool.
+    ISOLATION_HOST = 0;
+    // The container's resources are isolated from other pods, but shared with
+    // other containers in this pod.
+    ISOLATION_POD = 1;
+    // The container's resources are strictly exclusive to this container.
+    ISOLATION_CONTAINER = 2;
 }
 
 // ContainerResources contains information about the resources assigned to a container
@@ -44,6 +57,7 @@ message ContainerResources {
     repeated int64 cpu_ids = 3;
     repeated ContainerMemory memory = 4;
     repeated DynamicResource dynamic_resources = 5;
+    map<string, ResourceIsolation> isolation = 6;
 }
 
 // ContainerMemory contains information about memory and hugepages assigned to a container

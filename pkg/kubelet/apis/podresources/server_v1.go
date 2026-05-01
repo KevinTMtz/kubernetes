@@ -79,6 +79,10 @@ func (p *v1PodResourcesServer) List(ctx context.Context, req *podresourcesv1.Lis
 			Namespace:  pod.Namespace,
 			Containers: make([]*podresourcesv1.ContainerResources, 0, len(pod.Spec.Containers)),
 		}
+		if utilfeature.DefaultFeatureGate.Enabled(kubefeatures.PodLevelResourceManagers) {
+			pRes.CpuIds = p.cpusProvider.GetPodCPUs(string(pod.UID))
+			pRes.Memory = p.memoryProvider.GetPodMemory(string(pod.UID))
+		}
 
 		pRes.Containers = make([]*podresourcesv1.ContainerResources, 0, len(pod.Spec.InitContainers)+len(pod.Spec.Containers))
 		for _, container := range pod.Spec.InitContainers {
@@ -131,6 +135,10 @@ func (p *v1PodResourcesServer) Get(ctx context.Context, req *podresourcesv1.GetP
 		Namespace:  pod.Namespace,
 		Containers: make([]*podresourcesv1.ContainerResources, 0, len(pod.Spec.Containers)),
 	}
+	if utilfeature.DefaultFeatureGate.Enabled(kubefeatures.PodLevelResourceManagers) {
+		podResources.CpuIds = p.cpusProvider.GetPodCPUs(string(pod.UID))
+		podResources.Memory = p.memoryProvider.GetPodMemory(string(pod.UID))
+	}
 
 	podResources.Containers = make([]*podresourcesv1.ContainerResources, 0, len(pod.Spec.InitContainers)+len(pod.Spec.Containers))
 	for _, container := range pod.Spec.InitContainers {
@@ -159,5 +167,24 @@ func (p *v1PodResourcesServer) getContainerResources(pod *v1.Pod, container *v1.
 		Memory:           p.memoryProvider.GetMemory(string(pod.UID), container.Name),
 		DynamicResources: p.dynamicResourcesProvider.GetDynamicResources(pod, container),
 	}
+	if utilfeature.DefaultFeatureGate.Enabled(kubefeatures.PodLevelResourceManagers) {
+		containerResources.Isolation = map[string]podresourcesv1.ResourceIsolation{
+			"cpu":    mapResourceIsolation(p.cpusProvider.GetCPUIsolationLevel(pod, container)),
+			"memory": mapResourceIsolation(p.memoryProvider.GetMemoryIsolationLevel(pod, container)),
+		}
+	}
 	return containerResources
+}
+
+func mapResourceIsolation(isolation string) podresourcesv1.ResourceIsolation {
+	switch isolation {
+	case "pod":
+		return podresourcesv1.ResourceIsolation_ISOLATION_POD
+	case "container":
+		return podresourcesv1.ResourceIsolation_ISOLATION_CONTAINER
+	case "host":
+		fallthrough
+	default:
+		return podresourcesv1.ResourceIsolation_ISOLATION_HOST
+	}
 }

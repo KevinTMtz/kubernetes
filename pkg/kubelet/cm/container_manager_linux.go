@@ -1021,11 +1021,32 @@ func (cm *containerManagerImpl) GetCPUs(podUID, containerName string) []int64 {
 	return []int64{}
 }
 
+func (cm *containerManagerImpl) GetPodCPUs(podUID string) []int64 {
+	if cm.cpuManager == nil {
+		return []int64{}
+	}
+	return int64Slice(cm.cpuManager.GetPodCPUs(podUID).UnsortedList())
+}
+
 func (cm *containerManagerImpl) GetAllocatableCPUs() []int64 {
 	if cm.cpuManager != nil {
 		return int64Slice(cm.cpuManager.GetAllocatableCPUs().UnsortedList())
 	}
 	return []int64{}
+}
+
+func (cm *containerManagerImpl) GetCPUIsolationLevel(pod *v1.Pod, container *v1.Container) string {
+	if cm.cpuManager == nil {
+		return "host" // default to host if cpu manager is not available
+	}
+	return string(cm.cpuManager.GetResourceIsolationLevel(pod, container))
+}
+
+func (cm *containerManagerImpl) GetMemoryIsolationLevel(pod *v1.Pod, container *v1.Container) string {
+	if cm.memoryManager == nil {
+		return "host" // default to host if memory manager is not available
+	}
+	return string(cm.memoryManager.GetResourceIsolationLevel(pod, container))
 }
 
 func (cm *containerManagerImpl) GetMemory(podUID, containerName string) []*podresourcesapi.ContainerMemory {
@@ -1036,6 +1057,14 @@ func (cm *containerManagerImpl) GetMemory(podUID, containerName string) []*podre
 	// This is tempporary as part of migration of memory manager to Contextual logging.
 	// Direct context to be passed when container manager is migrated.
 	return containerMemoryFromBlock(cm.memoryManager.GetMemory(podUID, containerName))
+}
+
+func (cm *containerManagerImpl) GetPodMemory(podUID string) []*podresourcesapi.ContainerMemory {
+	if cm.memoryManager == nil {
+		return []*podresourcesapi.ContainerMemory{}
+	}
+
+	return containerMemoryFromBlock(cm.memoryManager.GetPodMemory(podUID))
 }
 
 func (cm *containerManagerImpl) GetAllocatableMemory() []*podresourcesapi.ContainerMemory {

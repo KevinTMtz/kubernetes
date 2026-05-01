@@ -43,15 +43,23 @@ type PodsProvider interface {
 type CPUsProvider interface {
 	// GetCPUs returns information about the cpus assigned to pods and containers
 	GetCPUs(podUID, containerName string) []int64
+	// GetPodCPUs returns information about the cpus assigned to a pod
+	GetPodCPUs(podUID string) []int64
 	// GetAllocatableCPUs returns the allocatable (not allocated) CPUs
 	GetAllocatableCPUs() []int64
+	// GetCPUIsolationLevel returns the cpu isolation level of the container
+	GetCPUIsolationLevel(pod *v1.Pod, container *v1.Container) string
 }
 
 type MemoryProvider interface {
 	// GetMemory returns information about the memory assigned to containers
 	GetMemory(podUID, containerName string) []*podresourcesapi.ContainerMemory
+	// GetPodMemory returns information about the memory assigned to a pod
+	GetPodMemory(podUID string) []*podresourcesapi.ContainerMemory
 	// GetAllocatableMemory returns the allocatable memory from the node
 	GetAllocatableMemory() []*podresourcesapi.ContainerMemory
+	// GetMemoryIsolationLevel returns the memory isolation level of the container
+	GetMemoryIsolationLevel(pod *v1.Pod, container *v1.Container) string
 }
 
 type DynamicResourcesProvider interface {

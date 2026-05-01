@@ -238,16 +238,42 @@ func (cm *FakeContainerManager) GetCPUs(_, _ string) []int64 {
 	return nil
 }
 
+func (cm *FakeContainerManager) GetPodCPUs(_ string) []int64 {
+	cm.Lock()
+	defer cm.Unlock()
+	cm.CalledFunctions = append(cm.CalledFunctions, "GetPodCPUs")
+	return nil
+}
+
 func (cm *FakeContainerManager) GetAllocatableCPUs() []int64 {
 	cm.Lock()
 	defer cm.Unlock()
 	return nil
 }
 
+func (cm *FakeContainerManager) GetCPUIsolationLevel(pod *v1.Pod, container *v1.Container) string {
+	cm.Lock()
+	defer cm.Unlock()
+	return "host"
+}
+
+func (cm *FakeContainerManager) GetMemoryIsolationLevel(pod *v1.Pod, container *v1.Container) string {
+	cm.Lock()
+	defer cm.Unlock()
+	return "host"
+}
+
 func (cm *FakeContainerManager) GetMemory(_, _ string) []*podresourcesapi.ContainerMemory {
 	cm.Lock()
 	defer cm.Unlock()
 	cm.CalledFunctions = append(cm.CalledFunctions, "GetMemory")
+	return nil
+}
+
+func (cm *FakeContainerManager) GetPodMemory(_ string) []*podresourcesapi.ContainerMemory {
+	cm.Lock()
+	defer cm.Unlock()
+	cm.CalledFunctions = append(cm.CalledFunctions, "GetPodMemory")
 	return nil
 }
 

@@ -336,6 +336,10 @@ func (cm *containerManagerImpl) GetCPUs(podUID, containerName string) []int64 {
 	return nil
 }
 
+func (cm *containerManagerImpl) GetPodCPUs(podUID string) []int64 {
+	return nil
+}
+
 func (cm *containerManagerImpl) GetAllocatableCPUs() []int64 {
 	if utilfeature.DefaultFeatureGate.Enabled(kubefeatures.WindowsCPUAndMemoryAffinity) {
 		if cm.cpuManager != nil {
@@ -346,7 +350,19 @@ func (cm *containerManagerImpl) GetAllocatableCPUs() []int64 {
 	return nil
 }
 
+func (cm *containerManagerImpl) GetCPUIsolationLevel(pod *v1.Pod, container *v1.Container) string {
+	return "host"
+}
+
+func (cm *containerManagerImpl) GetMemoryIsolationLevel(pod *v1.Pod, container *v1.Container) string {
+	return "host"
+}
+
 func (cm *containerManagerImpl) GetMemory(_, _ string) []*podresourcesapi.ContainerMemory {
+	return nil
+}
+
+func (cm *containerManagerImpl) GetPodMemory(_ string) []*podresourcesapi.ContainerMemory {
 	return nil
 }
 
