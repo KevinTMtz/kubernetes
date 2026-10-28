@@ -17,10 +17,13 @@ limitations under the License.
 package http
 
 import (
+	"bytes"
 	"crypto/tls"
 	"errors"
-	"fmt"
+	"io"
 	"net/http"
+	"strconv"
+	"sync"
 	"time"
 
 	utilnet "k8s.io/apimachinery/pkg/util/net"
@@ -33,6 +36,42 @@ import (
 const (
 	maxRespBodyLength = 10 * 1 << 10 // 10KB
 )
+
+type limitedReadBuffer struct {
+	buf bytes.Buffer
+	lr  io.LimitedReader
+}
+
+var respBufferPool = sync.Pool{
+	New: func() any {
+		lb := &limitedReadBuffer{}
+		lb.buf.Grow(1024)
+		return lb
+	},
+}
+
+func readBodyAtMost(r io.Reader, limit int64) (string, error) {
+	lb := respBufferPool.Get().(*limitedReadBuffer)
+	lb.buf.Reset()
+	lb.lr.R = r
+	lb.lr.N = limit + 1
+	defer func() {
+		lb.lr.R = nil
+		lb.lr.N = 0
+		if lb.buf.Cap() <= 64*1024 {
+			lb.buf.Reset()
+			respBufferPool.Put(lb)
+		}
+	}()
+
+	if _, err := lb.buf.ReadFrom(&lb.lr); err != nil {
+		return "", err
+	}
+	if int64(lb.buf.Len()) > limit {
+		return string(lb.buf.Bytes()[:limit]), utilio.ErrLimitReached
+	}
+	return lb.buf.String(), nil
+}
 
 // New creates Prober that will skip TLS verification while probing.
 // followNonLocalRedirects configures whether the prober should follow redirects to a different hostname.
@@ -125,27 +164,45 @@ func DoHTTPProbe(req *http.Request, client GetHTTPInterface) (probe.Result, stri
 		return probe.Failure, err.Error(), nil
 	}
 	defer res.Body.Close()
-	b, err := utilio.ReadAtMost(res.Body, maxRespBodyLength)
+	body, err := readBodyAtMost(res.Body, maxRespBodyLength)
 	if err != nil {
 		if err == utilio.ErrLimitReached {
-			klog.V(4).Infof("Non fatal body truncation for %s, Response: %v", url.String(), *res)
+			if klogV4 := klog.V(4); klogV4.Enabled() {
+				klogV4.Infof("Non fatal body truncation for %s, Response: %v", url.String(), *res)
+			}
 		} else {
 			return probe.Failure, "", err
 		}
 	}
-	body := string(b)
 	if res.StatusCode >= http.StatusOK && res.StatusCode < http.StatusBadRequest {
 		if res.StatusCode >= http.StatusMultipleChoices { // Redirect
-			klog.V(4).Infof("Probe terminated redirects for %s, Response: %v", url.String(), *res)
-			return probe.Warning, fmt.Sprintf("Probe terminated redirects, Response body: %v", body), nil
+			if klogV4 := klog.V(4); klogV4.Enabled() {
+				klogV4.Infof("Probe terminated redirects for %s, Response: %v", url.String(), *res)
+			}
+			return probe.Warning, "Probe terminated redirects, Response body: " + body, nil
 		}
-		klog.V(4).Infof("Probe succeeded for %s, Response: %v", url.String(), *res)
+		if klogV4 := klog.V(4); klogV4.Enabled() {
+			klogV4.Infof("Probe succeeded for %s, Response: %v", url.String(), *res)
+		}
 		return probe.Success, body, nil
 	}
-	klog.V(4).Infof("Probe failed for %s with request headers %v, response body: %v", url.String(), headers, body)
+	if klogV4 := klog.V(4); klogV4.Enabled() {
+		klogV4.Infof("Probe failed for %s with request headers %v, response body: %v", url.String(), headers, body)
+	}
 	// Note: Until https://issue.k8s.io/99425 is addressed, this user-facing failure message must not contain the response body.
-	failureMsg := fmt.Sprintf("HTTP probe failed with statuscode: %d", res.StatusCode)
+	failureMsg := "HTTP probe failed with statuscode: " + strconv.Itoa(res.StatusCode)
 	return probe.Failure, failureMsg, nil
+}
+
+func nonLocalRedirectChecker(req *http.Request, via []*http.Request) error {
+	if req.URL.Hostname() != via[0].URL.Hostname() {
+		return http.ErrUseLastResponse
+	}
+	// Default behavior: stop after 10 redirects.
+	if len(via) >= 10 {
+		return errors.New("stopped after 10 redirects")
+	}
+	return nil
 }
 
 // RedirectChecker returns a function that can be used to check HTTP redirects.
@@ -153,15 +210,5 @@ func RedirectChecker(followNonLocalRedirects bool) func(*http.Request, []*http.R
 	if followNonLocalRedirects {
 		return nil // Use the default http client checker.
 	}
-
-	return func(req *http.Request, via []*http.Request) error {
-		if req.URL.Hostname() != via[0].URL.Hostname() {
-			return http.ErrUseLastResponse
-		}
-		// Default behavior: stop after 10 redirects.
-		if len(via) >= 10 {
-			return errors.New("stopped after 10 redirects")
-		}
-		return nil
-	}
+	return nonLocalRedirectChecker
 }

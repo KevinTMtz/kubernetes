@@ -17,17 +17,29 @@ limitations under the License.
 package http
 
 import (
-	"fmt"
 	"net"
 	"net/http"
 	"net/url"
 	"strconv"
 	"strings"
+	"sync"
 
 	v1 "k8s.io/api/core/v1"
 	"k8s.io/component-base/version"
 	"k8s.io/kubernetes/pkg/probe"
 )
+
+var (
+	userAgentOnce         sync.Once
+	versionMajorMinor     string
+	defaultProbeUserAgent string
+)
+
+func initUserAgent() {
+	v := version.Get()
+	versionMajorMinor = v.Major + "." + v.Minor
+	defaultProbeUserAgent = "kube-probe/" + versionMajorMinor
+}
 
 // NewProbeRequest returns an http.Request suitable for use as a request for a
 // probe.
@@ -38,9 +50,14 @@ func NewProbeRequest(url *url.URL, headers http.Header) (*http.Request, error) {
 // NewRequestForHTTPGetAction returns an http.Request derived from httpGet.
 // When httpGet.Host is empty, podIP will be used instead.
 func NewRequestForHTTPGetAction(httpGet *v1.HTTPGetAction, container *v1.Container, podIP string, userAgentFragment string) (*http.Request, error) {
-	scheme := strings.ToLower(string(httpGet.Scheme))
-	if scheme == "" {
+	var scheme string
+	switch httpGet.Scheme {
+	case "", v1.URISchemeHTTP, "http":
 		scheme = "http"
+	case v1.URISchemeHTTPS, "https":
+		scheme = "https"
+	default:
+		scheme = strings.ToLower(string(httpGet.Scheme))
 	}
 
 	host := httpGet.Host
@@ -67,7 +84,7 @@ func newProbeRequest(url *url.URL, headers http.Header, userAgentFragment string
 	}
 
 	if headers == nil {
-		headers = http.Header{}
+		headers = make(http.Header, 2)
 	}
 	if _, ok := headers["User-Agent"]; !ok {
 		// User-Agent header was not defined, set it
@@ -87,8 +104,11 @@ func newProbeRequest(url *url.URL, headers http.Header, userAgentFragment string
 }
 
 func userAgent(purpose string) string {
-	v := version.Get()
-	return fmt.Sprintf("kube-%s/%s.%s", purpose, v.Major, v.Minor)
+	userAgentOnce.Do(initUserAgent)
+	if purpose == "probe" {
+		return defaultProbeUserAgent
+	}
+	return "kube-" + purpose + "/" + versionMajorMinor
 }
 
 // formatURL formats a URL from args.  For testability.
@@ -111,7 +131,7 @@ func formatURL(scheme string, host string, port int, path string) *url.URL {
 // v1HeaderToHTTPHeader takes a list of HTTPHeader <name, value> string pairs
 // and returns a populated string->[]string http.Header map.
 func v1HeaderToHTTPHeader(headerList []v1.HTTPHeader) http.Header {
-	headers := make(http.Header)
+	headers := make(http.Header, len(headerList)+2)
 	for _, header := range headerList {
 		headers.Add(header.Name, header.Value)
 	}

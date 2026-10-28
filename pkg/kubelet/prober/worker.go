@@ -63,7 +63,9 @@ type worker struct {
 	probeManager   *manager
 
 	// The last known container ID for this worker.
-	containerID kubecontainer.ContainerID
+	containerID        kubecontainer.ContainerID
+	lastContainerID    kubecontainer.ContainerID
+	lastContainerIDStr string
 	// The last probe result for this worker.
 	lastResult results.Result
 	// How many times in a row the probe has returned the same result.
@@ -71,6 +73,11 @@ type worker struct {
 
 	// If set, skip probing.
 	onHold bool
+
+	// Cached static/semi-static probe artifacts for this worker.
+	expandedExecCmd      []string
+	expandedExecCmdReady bool
+	httpCache            *httpProbeCache
 
 	// proberResultsMetricLabels holds the labels attached to this worker
 	// for the ProberResults metric by result.
@@ -195,7 +202,9 @@ probeLoop:
 			// Updating the periodic timer to run the probe again at intervals of probeTickerPeriod
 			// starting from the moment a manual run occurs.
 			probeTicker.Reset(probeTickerPeriod)
-			logger.V(4).Info("Triggered Probe by manual run", "probeType", w.probeType, "pod", klog.KObj(w.pod), "podUID", w.pod.UID, "containerName", w.container.Name)
+			if loggerV4 := logger.V(4); loggerV4.Enabled() {
+				loggerV4.Info("Triggered Probe by manual run", "probeType", w.probeType, "pod", klog.KObj(w.pod), "podUID", w.pod.UID, "containerName", w.container.Name)
+			}
 			// continue
 		}
 	}
@@ -221,14 +230,18 @@ func (w *worker) doProbe(ctx context.Context) (keepGoing bool) {
 	status, ok := w.probeManager.statusManager.GetPodStatus(w.pod.UID)
 	if !ok {
 		// Either the pod has not been created yet, or it was already deleted.
-		logger.V(3).Info("No status for pod", "pod", klog.KObj(w.pod))
+		if loggerV3 := logger.V(3); loggerV3.Enabled() {
+			loggerV3.Info("No status for pod", "pod", klog.KObj(w.pod))
+		}
 		return true
 	}
 
 	// Worker should terminate if pod is terminated.
 	if status.Phase == v1.PodFailed || status.Phase == v1.PodSucceeded {
-		logger.V(3).Info("Pod is terminated, exiting probe worker",
-			"pod", klog.KObj(w.pod), "phase", status.Phase)
+		if loggerV3 := logger.V(3); loggerV3.Enabled() {
+			loggerV3.Info("Pod is terminated, exiting probe worker",
+				"pod", klog.KObj(w.pod), "phase", status.Phase)
+		}
 		return false
 	}
 
@@ -237,8 +250,10 @@ func (w *worker) doProbe(ctx context.Context) (keepGoing bool) {
 		c, ok = podutil.GetContainerStatus(status.InitContainerStatuses, w.container.Name)
 		if !ok || len(c.ContainerID) == 0 {
 			// Either the container has not been created yet, or it was deleted.
-			logger.V(3).Info("Probe target container not found",
-				"pod", klog.KObj(w.pod), "containerName", w.container.Name)
+			if loggerV3 := logger.V(3); loggerV3.Enabled() {
+				loggerV3.Info("Probe target container not found",
+					"pod", klog.KObj(w.pod), "containerName", w.container.Name)
+			}
 			return true // Wait for more information.
 		}
 	}
@@ -247,12 +262,21 @@ func (w *worker) doProbe(ctx context.Context) (keepGoing bool) {
 		w.container.RestartPolicy != nil &&
 		*w.container.RestartPolicy == v1.ContainerRestartPolicyAlways
 
-	if w.containerID.String() != c.ContainerID {
+	if w.containerID != w.lastContainerID {
+		w.lastContainerID = w.containerID
+		w.lastContainerIDStr = w.containerID.String()
+	}
+
+	if w.lastContainerIDStr != c.ContainerID {
 		if !w.containerID.IsEmpty() {
 			w.resultsManager.Remove(w.containerID)
 		}
 
 		w.containerID = kubecontainer.ParseContainerID(logger, c.ContainerID)
+		w.lastContainerID = w.containerID
+		w.lastContainerIDStr = w.containerID.String()
+		w.httpCache = nil
+		w.expandedExecCmdReady = false
 
 		if !utilfeature.DefaultFeatureGate.Enabled(features.ChangeContainerStatusOnKubeletRestart) {
 			// The container start time alone cannot tell a container that survived the
@@ -306,8 +330,10 @@ func (w *worker) doProbe(ctx context.Context) (keepGoing bool) {
 	}
 
 	if c.State.Running == nil {
-		logger.V(3).Info("Non-running container probed",
-			"pod", klog.KObj(w.pod), "containerName", w.container.Name)
+		if loggerV3 := logger.V(3); loggerV3.Enabled() {
+			loggerV3.Info("Non-running container probed",
+				"pod", klog.KObj(w.pod), "containerName", w.container.Name)
+		}
 		if !w.containerID.IsEmpty() {
 			w.resultsManager.Set(w.containerID, results.Failure, w.pod)
 		}
@@ -328,8 +354,10 @@ func (w *worker) doProbe(ctx context.Context) (keepGoing bool) {
 
 	// Graceful shutdown of the pod.
 	if w.pod.ObjectMeta.DeletionTimestamp != nil && (w.probeType == liveness || w.probeType == startup) {
-		logger.V(3).Info("Pod deletion requested, setting probe result to success",
-			"probeType", w.probeType, "pod", klog.KObj(w.pod), "containerName", w.container.Name)
+		if loggerV3 := logger.V(3); loggerV3.Enabled() {
+			loggerV3.Info("Pod deletion requested, setting probe result to success",
+				"probeType", w.probeType, "pod", klog.KObj(w.pod), "containerName", w.container.Name)
+		}
 		if w.probeType == startup {
 			logger.Info("Pod deletion requested before container has fully started",
 				"pod", klog.KObj(w.pod), "containerName", w.container.Name)
@@ -359,7 +387,7 @@ func (w *worker) doProbe(ctx context.Context) (keepGoing bool) {
 	}
 
 	// Note, exec probe does NOT have access to pod environment variables or downward API
-	result, err := w.probeManager.prober.probe(ctx, w.probeType, w.pod, status, w.container, w.containerID)
+	result, err := w.probeManager.prober.probeInternal(ctx, w.probeType, w.pod, &status, &w.container, w.containerID, w)
 	if err != nil {
 		// Prober error, throw away the result.
 		return true
