@@ -21,6 +21,8 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"strconv"
+	"sync"
 
 	v1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -29,6 +31,32 @@ import (
 	clientset "k8s.io/client-go/kubernetes"
 	podutil "k8s.io/kubernetes/pkg/api/v1/pod"
 )
+
+const (
+	maxPooledPatchBufferCap = 64 * 1024
+
+	unchangedPatchPrefix = `{"metadata":{"uid":`
+	unchangedPatchSuffix = `}}`
+	emptyStatusJSON      = `{}`
+	statusKeyMid         = `},"status":`
+	statusKeyOnlyPrefix  = `{"status":`
+)
+
+var podStatusPatchMeta, podStatusPatchMetaErr = strategicpatch.NewPatchMetaFromStruct(v1.PodStatus{})
+
+type podStatusPatchBuffers struct {
+	oldBuf bytes.Buffer
+	newBuf bytes.Buffer
+}
+
+var podStatusPatchBufferPool = sync.Pool{
+	New: func() any {
+		b := &podStatusPatchBuffers{}
+		b.oldBuf.Grow(1024)
+		b.newBuf.Grow(1024)
+		return b
+	},
+}
 
 // PatchPodStatus patches pod status. It returns true and avoids an update if the patch contains no changes.
 func PatchPodStatus(ctx context.Context, c clientset.Interface, namespace, name string, uid types.UID, oldPodStatus, newPodStatus v1.PodStatus) (*v1.Pod, []byte, bool, error) {
@@ -47,27 +75,83 @@ func PatchPodStatus(ctx context.Context, c clientset.Interface, namespace, name 
 	return updatedPod, patchBytes, false, nil
 }
 
+func trimJSONEncoderNewline(b []byte) []byte {
+	if len(b) > 0 && b[len(b)-1] == '\n' {
+		return b[:len(b)-1]
+	}
+	return b
+}
+
+func buildUnchangedPodStatusPatch(uid types.UID) ([]byte, bool) {
+	if len(uid) == 0 {
+		return []byte(emptyStatusJSON), false
+	}
+	patchBytes := make([]byte, 0, len(unchangedPatchPrefix)+len(uid)+2+len(unchangedPatchSuffix))
+	patchBytes = append(patchBytes, unchangedPatchPrefix...)
+	patchBytes = strconv.AppendQuote(patchBytes, string(uid))
+	patchBytes = append(patchBytes, unchangedPatchSuffix...)
+	return patchBytes, true
+}
+
 func preparePatchBytesForPodStatus(namespace, name string, uid types.UID, oldPodStatus, newPodStatus v1.PodStatus) ([]byte, bool, error) {
-	oldData, err := json.Marshal(v1.Pod{
-		Status: oldPodStatus,
-	})
-	if err != nil {
+	bufs := podStatusPatchBufferPool.Get().(*podStatusPatchBuffers)
+	bufs.oldBuf.Reset()
+	bufs.newBuf.Reset()
+	defer func() {
+		if bufs.oldBuf.Cap() <= maxPooledPatchBufferCap && bufs.newBuf.Cap() <= maxPooledPatchBufferCap {
+			bufs.oldBuf.Reset()
+			bufs.newBuf.Reset()
+			podStatusPatchBufferPool.Put(bufs)
+		}
+	}()
+
+	if err := json.NewEncoder(&bufs.oldBuf).Encode(&oldPodStatus); err != nil {
 		return nil, false, fmt.Errorf("failed to Marshal oldData for pod %q/%q: %v", namespace, name, err)
 	}
+	oldStatusBytes := trimJSONEncoderNewline(bufs.oldBuf.Bytes())
 
-	newData, err := json.Marshal(v1.Pod{
-		ObjectMeta: metav1.ObjectMeta{UID: uid}, // only put the uid in the new object to ensure it appears in the patch as a precondition
-		Status:     newPodStatus,
-	})
-	if err != nil {
+	if err := json.NewEncoder(&bufs.newBuf).Encode(&newPodStatus); err != nil {
 		return nil, false, fmt.Errorf("failed to Marshal newData for pod %q/%q: %v", namespace, name, err)
 	}
+	newStatusBytes := trimJSONEncoderNewline(bufs.newBuf.Bytes())
 
-	patchBytes, err := strategicpatch.CreateTwoWayMergePatch(oldData, newData, v1.Pod{})
+	if bytes.Equal(oldStatusBytes, newStatusBytes) {
+		patchBytes, unchanged := buildUnchangedPodStatusPatch(uid)
+		return patchBytes, unchanged, nil
+	}
+
+	var (
+		statusPatch []byte
+		err         error
+	)
+	if podStatusPatchMetaErr == nil {
+		statusPatch, err = strategicpatch.CreateTwoWayMergePatchUsingLookupPatchMeta(oldStatusBytes, newStatusBytes, podStatusPatchMeta)
+	} else {
+		statusPatch, err = strategicpatch.CreateTwoWayMergePatch(oldStatusBytes, newStatusBytes, v1.PodStatus{})
+	}
 	if err != nil {
 		return nil, false, fmt.Errorf("failed to CreateTwoWayMergePatch for pod %q/%q: %v", namespace, name, err)
 	}
-	return patchBytes, bytes.Equal(patchBytes, []byte(fmt.Sprintf(`{"metadata":{"uid":%q}}`, uid))), nil
+	if bytes.Equal(statusPatch, []byte(emptyStatusJSON)) {
+		patchBytes, unchanged := buildUnchangedPodStatusPatch(uid)
+		return patchBytes, unchanged, nil
+	}
+
+	if len(uid) == 0 {
+		patchBytes := make([]byte, 0, len(statusKeyOnlyPrefix)+len(statusPatch)+1)
+		patchBytes = append(patchBytes, statusKeyOnlyPrefix...)
+		patchBytes = append(patchBytes, statusPatch...)
+		patchBytes = append(patchBytes, '}')
+		return patchBytes, false, nil
+	}
+
+	patchBytes := make([]byte, 0, len(unchangedPatchPrefix)+len(uid)+2+len(statusKeyMid)+len(statusPatch)+1)
+	patchBytes = append(patchBytes, unchangedPatchPrefix...)
+	patchBytes = strconv.AppendQuote(patchBytes, string(uid))
+	patchBytes = append(patchBytes, statusKeyMid...)
+	patchBytes = append(patchBytes, statusPatch...)
+	patchBytes = append(patchBytes, '}')
+	return patchBytes, false, nil
 }
 
 // ReplaceOrAppendPodCondition replaces the first pod condition with equal type or appends if there is none

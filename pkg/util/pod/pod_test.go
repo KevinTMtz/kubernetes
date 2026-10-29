@@ -85,6 +85,15 @@ func TestPatchPodStatus(t *testing.T) {
 			false,
 			[]byte(`{"metadata":{"uid":"myuid"},"status":{"initContainerStatuses":[{"image":"","imageID":"","lastState":{},"name":"init-container","ready":true,"restartCount":0,"state":{}}]}}`),
 		},
+		{
+			"clear scalar message field emits null inside status",
+			func(input v1.PodStatus) v1.PodStatus {
+				input.Message = ""
+				return input
+			},
+			false,
+			[]byte(`{"metadata":{"uid":"myuid"},"status":{"message":null}}`),
+		},
 	}
 	for _, tc := range testCases {
 		t.Run(tc.description, func(t *testing.T) {
@@ -100,6 +109,37 @@ func TestPatchPodStatus(t *testing.T) {
 			}
 		})
 	}
+
+	t.Run("empty uid unchanged returns empty json with unchanged=false", func(t *testing.T) {
+		_, patchBytes, unchanged, err := PatchPodStatus(context.TODO(), client, ns, name, "", getPodStatus(), getPodStatus())
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if unchanged {
+			t.Fatalf("expected unchanged=false when uid is empty")
+		}
+		if want := []byte(`{}`); !reflect.DeepEqual(patchBytes, want) {
+			t.Fatalf("expect patchBytes: %q, got: %q", want, patchBytes)
+		}
+	})
+
+	t.Run("hostIPs merge key deletion and reordering", func(t *testing.T) {
+		oldStatus := getPodStatus()
+		oldStatus.HostIPs = []v1.HostIP{{IP: "10.0.0.1"}, {IP: "10.0.0.2"}}
+		newStatus := getPodStatus()
+		newStatus.HostIPs = []v1.HostIP{{IP: "10.0.0.2"}}
+		_, patchBytes, unchanged, err := PatchPodStatus(context.TODO(), client, ns, name, uid, oldStatus, newStatus)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if unchanged {
+			t.Fatalf("expected unchanged=false on hostIPs deletion")
+		}
+		want := []byte(`{"metadata":{"uid":"myuid"},"status":{"$setElementOrder/hostIPs":[{"ip":"10.0.0.2"}],"hostIPs":[{"$patch":"delete","ip":"10.0.0.1"}]}}`)
+		if !reflect.DeepEqual(patchBytes, want) {
+			t.Fatalf("expect patchBytes: %q, got: %q", want, patchBytes)
+		}
+	})
 }
 
 func getPodStatus() v1.PodStatus {

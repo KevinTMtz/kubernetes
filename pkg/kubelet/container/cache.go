@@ -107,8 +107,14 @@ func (c *cache) Get(_ context.Context, id types.UID) (*PodStatus, error) {
 }
 
 func (c *cache) GetNewerThan(ctx context.Context, id types.UID, minTime time.Time) (*PodStatus, error) {
+	c.lock.RLock()
+	d := c.getIfNewerThan(id, minTime)
+	c.lock.RUnlock()
+	if d != nil {
+		return d.status, d.err
+	}
 	ch := c.subscribe(id, minTime)
-	d := <-ch
+	d = <-ch
 	return d.status, d.err
 }
 
@@ -208,20 +214,23 @@ func (c *cache) notify(id types.UID, timestamp time.Time) {
 		// No one to notify.
 		return
 	}
-	newList := []*subRecord{}
+	n := 0
 	for i, r := range list {
 		if timestamp.Before(r.time) {
 			// Doesn't meet the time requirement; keep the record.
-			newList = append(newList, list[i])
+			list[n] = r
+			n++
 			continue
 		}
 		r.ch <- c.get(id)
 		close(r.ch)
+		list[i] = nil
 	}
-	if len(newList) == 0 {
+	if n == 0 {
 		delete(c.subscribers, id)
 	} else {
-		c.subscribers[id] = newList
+		clear(list[n:])
+		c.subscribers[id] = list[:n]
 	}
 }
 

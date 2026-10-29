@@ -46,6 +46,59 @@ const (
 	RestartAllContainersStarted = "RestartAllContainersStarted"
 )
 
+func bracketedContainerListLen(prefix string, names []string) int {
+	n := len(prefix) + 3 // ": [" + "]"
+	for i, s := range names {
+		if i > 0 {
+			n++
+		}
+		n += len(s)
+	}
+	return n
+}
+
+func writeBracketedContainerList(b *strings.Builder, prefix string, names []string) {
+	b.WriteString(prefix)
+	b.WriteString(": [")
+	for i, s := range names {
+		if i > 0 {
+			b.WriteByte(' ')
+		}
+		b.WriteString(s)
+	}
+	b.WriteByte(']')
+}
+
+// formatUnreadyContainersMessage formats the unready/unknown/incomplete container message
+// without fmt.Sprintf or intermediate string slices.
+func formatUnreadyContainersMessage(firstPrefix string, first []string, secondPrefix string, second []string) string {
+	if len(first) == 0 && len(second) == 0 {
+		return ""
+	}
+	n := 0
+	if len(first) > 0 {
+		n += bracketedContainerListLen(firstPrefix, first)
+	}
+	if len(second) > 0 {
+		if len(first) > 0 {
+			n += 2 // ", "
+		}
+		n += bracketedContainerListLen(secondPrefix, second)
+	}
+	var b strings.Builder
+	b.Grow(n)
+	if len(first) > 0 {
+		writeBracketedContainerList(&b, firstPrefix, first)
+	}
+	if len(second) > 0 {
+		if len(first) > 0 {
+			b.WriteString(", ")
+		}
+		writeBracketedContainerList(&b, secondPrefix, second)
+	}
+	return b.String()
+}
+
 // GenerateContainersReadyCondition returns the status of "ContainersReady" condition.
 // The status of "ContainersReady" condition is true when all containers are ready.
 func GenerateContainersReadyCondition(pod *v1.Pod, oldPodStatus *v1.PodStatus, containerStatuses []v1.ContainerStatus, podPhase v1.PodPhase) v1.PodCondition {
@@ -58,8 +111,9 @@ func GenerateContainersReadyCondition(pod *v1.Pod, oldPodStatus *v1.PodStatus, c
 			Reason:             UnknownContainerStatuses,
 		}
 	}
-	unknownContainers := []string{}
-	unreadyContainers := []string{}
+	var unknownBuf, unreadyBuf [8]string
+	unknownContainers := unknownBuf[:0]
+	unreadyContainers := unreadyBuf[:0]
 
 	for _, container := range pod.Spec.InitContainers {
 		if !podutil.IsRestartableInitContainer(&container) {
@@ -96,14 +150,7 @@ func GenerateContainersReadyCondition(pod *v1.Pod, oldPodStatus *v1.PodStatus, c
 	}
 
 	// Generate message for containers in unknown condition.
-	unreadyMessages := []string{}
-	if len(unknownContainers) > 0 {
-		unreadyMessages = append(unreadyMessages, fmt.Sprintf("containers with unknown status: %s", unknownContainers))
-	}
-	if len(unreadyContainers) > 0 {
-		unreadyMessages = append(unreadyMessages, fmt.Sprintf("containers with unready status: %s", unreadyContainers))
-	}
-	unreadyMessage := strings.Join(unreadyMessages, ", ")
+	unreadyMessage := formatUnreadyContainersMessage("containers with unknown status", unknownContainers, "containers with unready status", unreadyContainers)
 	if unreadyMessage != "" {
 		return v1.PodCondition{
 			Type:               v1.ContainersReady,
@@ -126,6 +173,10 @@ func GenerateContainersReadyCondition(pod *v1.Pod, oldPodStatus *v1.PodStatus, c
 // AND all matching conditions specified in the ReadinessGates have status equal to "True".
 func GeneratePodReadyCondition(pod *v1.Pod, oldPodStatus *v1.PodStatus, conditions []v1.PodCondition, containerStatuses []v1.ContainerStatus, podPhase v1.PodPhase) v1.PodCondition {
 	containersReady := GenerateContainersReadyCondition(pod, oldPodStatus, containerStatuses, podPhase)
+	return generatePodReadyConditionFromContainersReady(pod, oldPodStatus, conditions, containersReady)
+}
+
+func generatePodReadyConditionFromContainersReady(pod *v1.Pod, oldPodStatus *v1.PodStatus, conditions []v1.PodCondition, containersReady v1.PodCondition) v1.PodCondition {
 	// If the status of ContainersReady is not True, return the same status, reason and message as ContainersReady.
 	if containersReady.Status != v1.ConditionTrue {
 		return v1.PodCondition{
@@ -139,7 +190,7 @@ func GeneratePodReadyCondition(pod *v1.Pod, oldPodStatus *v1.PodStatus, conditio
 
 	// Evaluate corresponding conditions specified in readiness gate
 	// Generate message if any readiness gate is not satisfied.
-	unreadyMessages := []string{}
+	var unreadyMessages []string
 	for _, rg := range pod.Spec.ReadinessGates {
 		_, c := podutil.GetPodConditionFromList(conditions, rg.ConditionType)
 		if c == nil {
@@ -194,8 +245,9 @@ func GeneratePodInitializedCondition(pod *v1.Pod, oldPodStatus *v1.PodStatus, co
 		}
 	}
 
-	unknownContainers := []string{}
-	incompleteContainers := []string{}
+	var unknownBuf, incompleteBuf [8]string
+	unknownContainers := unknownBuf[:0]
+	incompleteContainers := incompleteBuf[:0]
 	for _, container := range pod.Spec.InitContainers {
 		containerStatus, ok := podutil.GetContainerStatus(containerStatuses, container.Name)
 		if !ok {
@@ -229,14 +281,7 @@ func GeneratePodInitializedCondition(pod *v1.Pod, oldPodStatus *v1.PodStatus, co
 		}
 	}
 
-	unreadyMessages := make([]string, 0, len(unknownContainers)+len(incompleteContainers))
-	if len(unknownContainers) > 0 {
-		unreadyMessages = append(unreadyMessages, fmt.Sprintf("containers with unknown status: %s", unknownContainers))
-	}
-	if len(incompleteContainers) > 0 {
-		unreadyMessages = append(unreadyMessages, fmt.Sprintf("containers with incomplete status: %s", incompleteContainers))
-	}
-	unreadyMessage := strings.Join(unreadyMessages, ", ")
+	unreadyMessage := formatUnreadyContainersMessage("containers with unknown status", unknownContainers, "containers with incomplete status", incompleteContainers)
 	if unreadyMessage != "" {
 		// During pod in-place restart, init container status can change from completed to waiting.
 		// However, it is assumed that once a pod is initialized, it cannot be uninitialized. If

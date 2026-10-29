@@ -24,7 +24,6 @@ import (
 	"time"
 
 	"k8s.io/apimachinery/pkg/types"
-	"k8s.io/apimachinery/pkg/util/sets"
 	utilfeature "k8s.io/apiserver/pkg/util/feature"
 	runtimeapi "k8s.io/cri-api/pkg/apis/runtime/v1"
 	"k8s.io/klog/v2"
@@ -325,6 +324,19 @@ func (g *GenericPLEG) Relist(ctx context.Context) {
 	g.cache.UpdateTime(timestamp)
 }
 
+func containersUnchanged(oldContainers, newContainers []*kubecontainer.Container) bool {
+	if len(oldContainers) != len(newContainers) {
+		return false
+	}
+	for i, oldC := range oldContainers {
+		newC := newContainers[i]
+		if oldC.ID != newC.ID || convertState(oldC.State) != convertState(newC.State) {
+			return false
+		}
+	}
+	return true
+}
+
 // reconcilePodRecord compares the old & current pod record and checks for event-worthy state
 // changes. If any events are generated, or the pod needs reinspection, it fetches the updated
 // status, updates the pod cache, and delivers the events. This function should only be called after
@@ -334,12 +346,21 @@ func (g *GenericPLEG) reconcilePodRecord(ctx context.Context, pid types.UID) {
 	// Compare the old and the current pods, and generate events.
 	oldPod := g.podRecords.getOld(pid)
 	pod := g.podRecords.getCurrent(pid)
-	// Get all containers in the old and the new pod.
-	allContainers := getContainersFromPods(oldPod, pod)
 	var events []*PodLifecycleEvent
-	for _, container := range allContainers {
-		containerEvents := computeEvents(logger, oldPod, pod, &container.ID)
-		events = append(events, containerEvents...)
+	if oldPod == nil || pod == nil || !containersUnchanged(oldPod.Containers, pod.Containers) || !containersUnchanged(oldPod.Sandboxes, pod.Sandboxes) {
+		// Get all containers in the old and the new pod.
+		allContainers := getContainersFromPods(oldPod, pod)
+		for _, container := range allContainers {
+			containerEvents := computeEvents(logger, oldPod, pod, &container.ID)
+			if len(containerEvents) == 0 {
+				continue
+			}
+			if len(events) == 0 {
+				events = containerEvents
+			} else {
+				events = append(events, containerEvents...)
+			}
+		}
 	}
 
 	_, reinspect := g.podsToReinspect.LoadAndDelete(pid)
@@ -378,7 +399,7 @@ func (g *GenericPLEG) reconcilePodRecord(ctx context.Context, pid types.UID) {
 	g.podRecords.update(pid)
 
 	// Map from containerId to exit code; used as a temporary cache for lookup
-	containerExitCode := make(map[string]int)
+	var containerExitCode map[string]int
 
 	for i := range events {
 		// Filter out events that are not reliable and no other components use yet.
@@ -394,11 +415,10 @@ func (g *GenericPLEG) reconcilePodRecord(ctx context.Context, pid types.UID) {
 		// Log exit code of containers when they finished in a particular event
 		if events[i].Type == ContainerDied {
 			// Fill up containerExitCode map for ContainerDied event when first time appeared
-			if len(containerExitCode) == 0 && pod != nil {
-				if err == nil {
-					for _, containerStatus := range status.ContainerStatuses {
-						containerExitCode[containerStatus.ID.ID] = containerStatus.ExitCode
-					}
+			if containerExitCode == nil && pod != nil && err == nil {
+				containerExitCode = make(map[string]int, len(status.ContainerStatuses))
+				for _, containerStatus := range status.ContainerStatuses {
+					containerExitCode[containerStatus.ID.ID] = containerStatus.ExitCode
 				}
 			}
 			if containerID, ok := events[i].Data.(string); ok {
@@ -444,16 +464,29 @@ func (g *GenericPLEG) relistPod(ctx context.Context, podUID types.UID) {
 }
 
 func getContainersFromPods(pods ...*kubecontainer.Pod) []*kubecontainer.Container {
-	cidSet := sets.New[string]()
-	var containers []*kubecontainer.Container
-	fillCidSet := func(cs []*kubecontainer.Container) {
+	total := 0
+	for _, p := range pods {
+		if p != nil {
+			total += len(p.Containers) + len(p.Sandboxes)
+		}
+	}
+	if total == 0 {
+		return nil
+	}
+	containers := make([]*kubecontainer.Container, 0, total)
+	fillContainers := func(cs []*kubecontainer.Container) {
 		for _, c := range cs {
 			cid := c.ID.ID
-			if cidSet.Has(cid) {
-				continue
+			exists := false
+			for _, existing := range containers {
+				if existing.ID.ID == cid {
+					exists = true
+					break
+				}
 			}
-			cidSet.Insert(cid)
-			containers = append(containers, c)
+			if !exists {
+				containers = append(containers, c)
+			}
 		}
 	}
 
@@ -461,10 +494,10 @@ func getContainersFromPods(pods ...*kubecontainer.Pod) []*kubecontainer.Containe
 		if p == nil {
 			continue
 		}
-		fillCidSet(p.Containers)
+		fillContainers(p.Containers)
 		// Update sandboxes as containers
 		// TODO: keep track of sandboxes explicitly.
-		fillCidSet(p.Sandboxes)
+		fillContainers(p.Sandboxes)
 	}
 	return containers
 }
@@ -581,14 +614,27 @@ func getContainerState(pod *kubecontainer.Pod, cid *kubecontainer.ContainerID) p
 
 func updateRunningPodAndContainerMetrics(pods []*kubecontainer.Pod) {
 	runningSandboxNum := 0
-	// intermediate map to store the count of each "container_state"
-	containerStateCount := make(map[string]int)
+	var runningCount, createdCount, exitedCount, unknownCount int
+	var otherStateCount map[string]int
 
 	for _, pod := range pods {
 		containers := pod.Containers
 		for _, container := range containers {
-			// update the corresponding "container_state" in map to set value for the gaugeVec metrics
-			containerStateCount[string(container.State)]++
+			switch container.State {
+			case kubecontainer.ContainerStateRunning:
+				runningCount++
+			case kubecontainer.ContainerStateCreated:
+				createdCount++
+			case kubecontainer.ContainerStateExited:
+				exitedCount++
+			case kubecontainer.ContainerStateUnknown:
+				unknownCount++
+			default:
+				if otherStateCount == nil {
+					otherStateCount = make(map[string]int)
+				}
+				otherStateCount[string(container.State)]++
+			}
 		}
 
 		sandboxes := pod.Sandboxes
@@ -601,7 +647,19 @@ func updateRunningPodAndContainerMetrics(pods []*kubecontainer.Pod) {
 			}
 		}
 	}
-	for key, value := range containerStateCount {
+	if runningCount > 0 {
+		metrics.RunningContainerCount.WithLabelValues(string(kubecontainer.ContainerStateRunning)).Set(float64(runningCount))
+	}
+	if createdCount > 0 {
+		metrics.RunningContainerCount.WithLabelValues(string(kubecontainer.ContainerStateCreated)).Set(float64(createdCount))
+	}
+	if exitedCount > 0 {
+		metrics.RunningContainerCount.WithLabelValues(string(kubecontainer.ContainerStateExited)).Set(float64(exitedCount))
+	}
+	if unknownCount > 0 {
+		metrics.RunningContainerCount.WithLabelValues(string(kubecontainer.ContainerStateUnknown)).Set(float64(unknownCount))
+	}
+	for key, value := range otherStateCount {
 		metrics.RunningContainerCount.WithLabelValues(key).Set(float64(value))
 	}
 

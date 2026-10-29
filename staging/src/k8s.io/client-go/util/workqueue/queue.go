@@ -74,7 +74,11 @@ func (q *queue[T]) Pop() (item T) {
 
 	// The underlying array still exists and reference this object, so the object will not be garbage collected.
 	(*q)[0] = *new(T)
-	*q = (*q)[1:]
+	if len(*q) == 1 {
+		*q = (*q)[:0]
+	} else {
+		*q = (*q)[1:]
+	}
 
 	return item
 }

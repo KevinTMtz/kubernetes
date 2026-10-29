@@ -50,10 +50,16 @@ func NewBasicWorkQueue(clock clock.Clock) WorkQueue {
 func (q *basicWorkQueue) GetWork() []types.UID {
 	q.lock.Lock()
 	defer q.lock.Unlock()
+	if len(q.queue) == 0 {
+		return nil
+	}
 	now := q.clock.Now()
 	var items []types.UID
 	for k, v := range q.queue {
 		if v.Before(now) {
+			if items == nil {
+				items = make([]types.UID, 0, len(q.queue))
+			}
 			items = append(items, k)
 			delete(q.queue, k)
 		}
