@@ -132,17 +132,17 @@ func (f *PullManager) writePulledRecordIfChanged(ctx context.Context, image, ima
 	var pulledRecordChanged bool
 	if pulledRecord == nil {
 		pulledRecordChanged = true
+		var credMap map[string]kubeletconfiginternal.ImagePullCredentials
+		if credentials != nil {
+			credMap = make(map[string]kubeletconfiginternal.ImagePullCredentials, 1)
+			credMap[sanitizedImage] = *credentials
+		} else {
+			credMap = make(map[string]kubeletconfiginternal.ImagePullCredentials)
+		}
 		pulledRecord = &kubeletconfiginternal.ImagePulledRecord{
 			LastUpdatedTime:   metav1.Time{Time: time.Now()},
 			ImageRef:          imageRef,
-			CredentialMapping: make(map[string]kubeletconfiginternal.ImagePullCredentials),
-		}
-		// just the existence of the pulled record for a given imageRef is enough
-		// for us to consider it kubelet-pulled. The kubelet should fail safe
-		// if it does not find a credential record for the specific image, and it
-		// must require credential validation
-		if credentials != nil {
-			pulledRecord.CredentialMapping[sanitizedImage] = *credentials
+			CredentialMapping: credMap,
 		}
 	} else {
 		pulledRecord, pulledRecordChanged = pulledRecordMergeNewCreds(pulledRecord, sanitizedImage, credentials)
@@ -337,6 +337,9 @@ func (f *PullManager) PruneUnknownRecords(ctx context.Context, imageList []strin
 	if err != nil {
 		logger.Error(err, "there were errors listing ImagePulledRecords, garbage collection will proceed with incomplete records list")
 	}
+	if len(pulledRecords) == 0 {
+		return
+	}
 
 	imagesInUse := sets.New(imageList...)
 	for _, imageRecord := range pulledRecords {
@@ -525,7 +528,27 @@ func pulledRecordMergeNewCreds(orig *kubeletconfiginternal.ImagePulledRecord, im
 // The returned slice is sorted by Namespace, Name and UID (in this order). Also
 // returns an indicator whether the set of input secrets chaged.
 func mergePullSecrets(orig, new []kubeletconfiginternal.ImagePullSecret) ([]kubeletconfiginternal.ImagePullSecret, bool) {
-	credSet := make(map[kubeSecretCoordinates]string)
+	allPresent := true
+	for _, s := range new {
+		found := false
+		for _, existing := range orig {
+			if existing.UID == s.UID && existing.Namespace == s.Namespace && existing.Name == s.Name {
+				if existing.CredentialHash == s.CredentialHash {
+					found = true
+				}
+				break
+			}
+		}
+		if !found {
+			allPresent = false
+			break
+		}
+	}
+	if allPresent {
+		return orig, false
+	}
+
+	credSet := make(map[kubeSecretCoordinates]string, len(orig)+len(new))
 	for _, secret := range orig {
 		credSet[kubeSecretCoordinates{
 			UID:       secret.UID,
@@ -580,7 +603,18 @@ func imagePullSecretLess(a, b kubeletconfiginternal.ImagePullSecret) int {
 // The returned slice is sorted by Namespace, Name and UID (in this order).
 // Also returns an indicator whether the set of input service accounts changed.
 func mergePullServiceAccounts(orig, new []kubeletconfiginternal.ImagePullServiceAccount) ([]kubeletconfiginternal.ImagePullServiceAccount, bool) {
-	credSet := sets.New[kubeletconfiginternal.ImagePullServiceAccount]()
+	allPresent := true
+	for _, s := range new {
+		if !slices.Contains(orig, s) {
+			allPresent = false
+			break
+		}
+	}
+	if allPresent {
+		return orig, false
+	}
+
+	credSet := make(sets.Set[kubeletconfiginternal.ImagePullServiceAccount], len(orig)+len(new))
 	for _, serviceAccount := range orig {
 		credSet.Insert(serviceAccount)
 	}

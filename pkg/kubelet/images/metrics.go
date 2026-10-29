@@ -17,7 +17,6 @@ limitations under the License.
 package images
 
 import (
-	"strconv"
 	"strings"
 	"sync"
 
@@ -25,6 +24,12 @@ import (
 	"k8s.io/component-base/metrics"
 	"k8s.io/component-base/metrics/legacyregistry"
 	kubeletmetrics "k8s.io/kubernetes/pkg/kubelet/metrics"
+)
+
+const (
+	metricLabelUnknown = "unknown"
+	metricLabelTrue    = "true"
+	metricLabelFalse   = "false"
 )
 
 var (
@@ -47,18 +52,21 @@ func registerMetrics() {
 	})
 }
 
-func recordEnsureImageRequest(pullPolicy v1.PullPolicy, imagePresentLocally, imagePullRequired *bool) {
-	presentLocally := "unknown"
-	if imagePresentLocally != nil {
-		presentLocally = strconv.FormatBool(*imagePresentLocally)
-	}
-	pullRequired := "unknown"
-	if imagePullRequired != nil {
-		pullRequired = strconv.FormatBool(*imagePullRequired)
+func recordEnsureImageRequest(pullPolicy v1.PullPolicy, presentLocally, pullRequired string) {
+	var policy string
+	switch pullPolicy {
+	case v1.PullAlways:
+		policy = "always"
+	case v1.PullIfNotPresent:
+		policy = "ifnotpresent"
+	case v1.PullNever:
+		policy = "never"
+	default:
+		policy = strings.ToLower(string(pullPolicy))
 	}
 
 	ensureImageRequestsCounter.WithLabelValues(
-		strings.ToLower(string(pullPolicy)),
+		policy,
 		presentLocally,
 		pullRequired,
 	).Inc()

@@ -599,7 +599,7 @@ func (m *kubeGenericRuntimeManager) convertToKubeContainerStatus(ctx context.Con
 	cStatus = m.toKubeContainerStatus(ctx, podUID, status, m.runtimeName)
 	if status.State == runtimeapi.ContainerState_CONTAINER_EXITED {
 		// Populate the termination message if needed.
-		annotatedInfo := getContainerInfoFromAnnotations(ctx, status.Annotations)
+		annotatedInfo := getContainerInfoFromAnnotationsValue(ctx, status.Annotations)
 		// If a container cannot even be started, it certainly does not have logs, so no need to fallbackToLogs.
 		fallbackToLogs := annotatedInfo.TerminationMessagePolicy == v1.TerminationMessageFallbackToLogsOnError &&
 			cStatus.ExitCode != 0 && cStatus.Reason != "ContainerCannotRun"
@@ -665,8 +665,8 @@ func (m *kubeGenericRuntimeManager) getSandboxes(ctx context.Context, opts listO
 func (m *kubeGenericRuntimeManager) getPodContainerStatuses(ctx context.Context, pod *kubecontainer.Pod, activePodSandboxID string) ([]*kubecontainer.Status, []*kubecontainer.Status, error) {
 	logger := klog.FromContext(ctx)
 
-	statuses := []*kubecontainer.Status{}
-	activeContainerStatuses := []*kubecontainer.Status{}
+	statuses := make([]*kubecontainer.Status, 0, len(pod.Containers))
+	activeContainerStatuses := make([]*kubecontainer.Status, 0, len(pod.Containers))
 	// TODO: optimization: set maximum number of containers per container name to examine.
 	for _, c := range pod.Containers {
 		resp, err := m.runtimeService.ContainerStatus(ctx, c.ID.ID, false)
@@ -699,8 +699,8 @@ func (m *kubeGenericRuntimeManager) getPodContainerStatuses(ctx context.Context,
 }
 
 func (m *kubeGenericRuntimeManager) toKubeContainerStatus(ctx context.Context, podUID kubetypes.UID, status *runtimeapi.ContainerStatus, runtimeName string) *kubecontainer.Status {
-	annotatedInfo := getContainerInfoFromAnnotations(ctx, status.Annotations)
-	labeledInfo := getContainerInfoFromLabels(ctx, status.Labels)
+	annotatedInfo := getContainerInfoFromAnnotationsValue(ctx, status.Annotations)
+	labeledInfo := getContainerInfoFromLabelsValue(ctx, status.Labels)
 	var cStatusResources *kubecontainer.ContainerResources
 	if utilfeature.DefaultFeatureGate.Enabled(features.InPlacePodVerticalScaling) {
 		// If runtime reports cpu & memory resources info, add it to container status
@@ -738,11 +738,12 @@ func (m *kubeGenericRuntimeManager) toKubeContainerStatus(ctx context.Context, p
 
 	var cStatusStopSignal *v1.Signal
 	if utilfeature.DefaultFeatureGate.Enabled(features.ContainerStopSignals) {
-		signal := status.GetStopSignal().String()
 		// Here Signal_SIGNAL_RUNTIME_DEFAULT means that the runtime is not returning any StopSignal
 		// This happens only when the container runtime version doesn't support StopSignal yet
-		if signal != "" && signal != runtimeapi.Signal_SIGNAL_RUNTIME_DEFAULT.String() {
-			cStatusStopSignal = runtimeSignalToString(status.GetStopSignal())
+		if stopSignal := status.GetStopSignal(); stopSignal != runtimeapi.Signal_SIGNAL_RUNTIME_DEFAULT {
+			if signal := stopSignal.String(); signal != "" {
+				cStatusStopSignal = runtimeSignalToString(stopSignal)
+			}
 		}
 	}
 
@@ -777,17 +778,20 @@ func (m *kubeGenericRuntimeManager) toKubeContainerStatus(ctx context.Context, p
 		cStatus.FinishedAt = time.Unix(0, status.FinishedAt)
 	}
 
-	for _, mount := range status.Mounts {
-		cStatus.Mounts = append(cStatus.Mounts, kubecontainer.Mount{
-			HostPath:          mount.HostPath,
-			ContainerPath:     mount.ContainerPath,
-			ReadOnly:          mount.Readonly,
-			RecursiveReadOnly: mount.RecursiveReadOnly,
-			SELinuxRelabel:    mount.SelinuxRelabel,
-			Propagation:       mount.Propagation,
-			Image:             mount.Image,
-			ImageSubPath:      mount.ImageSubPath,
-		})
+	if len(status.Mounts) > 0 {
+		cStatus.Mounts = make([]kubecontainer.Mount, len(status.Mounts))
+		for i, mount := range status.Mounts {
+			cStatus.Mounts[i] = kubecontainer.Mount{
+				HostPath:          mount.HostPath,
+				ContainerPath:     mount.ContainerPath,
+				ReadOnly:          mount.Readonly,
+				RecursiveReadOnly: mount.RecursiveReadOnly,
+				SELinuxRelabel:    mount.SelinuxRelabel,
+				Propagation:       mount.Propagation,
+				Image:             mount.Image,
+				ImageSubPath:      mount.ImageSubPath,
+			}
+		}
 	}
 	return cStatus
 }

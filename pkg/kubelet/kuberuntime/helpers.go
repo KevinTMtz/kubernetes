@@ -111,7 +111,6 @@ func (m *kubeGenericRuntimeManager) toKubeContainer(ctx context.Context, c *runt
 		imageID = c.ImageId
 	}
 
-	annotatedInfo := getContainerInfoFromAnnotations(ctx, c.Annotations)
 	return &kubecontainer.Container{
 		ID:                  kubecontainer.ContainerID{Type: m.runtimeName, ID: c.Id},
 		Name:                c.GetMetadata().GetName(),
@@ -119,7 +118,7 @@ func (m *kubeGenericRuntimeManager) toKubeContainer(ctx context.Context, c *runt
 		ImageRef:            c.ImageRef,
 		ImageRuntimeHandler: c.Image.RuntimeHandler,
 		Image:               c.Image.Image,
-		Hash:                annotatedInfo.Hash,
+		Hash:                getContainerHashFromAnnotations(ctx, c.Annotations),
 		State:               toKubeContainerState(c.State),
 		PodSandboxID:        c.PodSandboxId,
 		CreatedAt:           c.CreatedAt,
@@ -540,13 +539,15 @@ func getContainerConfigStopSignal(container *v1.Container) (stopsignal *runtimea
 	return nil
 }
 
-func runtimeSignalToString(signal runtimeapi.Signal) *v1.Signal {
-	var convertedSignal v1.Signal
+var runtimeEnumToSignalName = func() map[runtimeapi.Signal]v1.Signal {
+	m := make(map[runtimeapi.Signal]v1.Signal, len(signalNameToRuntimeEnum))
 	for key, value := range signalNameToRuntimeEnum {
-		if value == signal {
-			convertedSignal = v1.Signal(key)
-		}
+		m[value] = v1.Signal(key)
 	}
+	return m
+}()
 
+func runtimeSignalToString(signal runtimeapi.Signal) *v1.Signal {
+	convertedSignal := runtimeEnumToSignalName[signal]
 	return &convertedSignal
 }

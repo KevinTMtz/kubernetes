@@ -177,8 +177,13 @@ func getPodSandboxInfoFromAnnotations(annotations map[string]string) *annotatedP
 
 // getContainerInfoFromLabels gets labeledContainerInfo from labels.
 func getContainerInfoFromLabels(ctx context.Context, labels map[string]string) *labeledContainerInfo {
+	info := getContainerInfoFromLabelsValue(ctx, labels)
+	return &info
+}
+
+func getContainerInfoFromLabelsValue(ctx context.Context, labels map[string]string) labeledContainerInfo {
 	logger := klog.FromContext(ctx)
-	return &labeledContainerInfo{
+	return labeledContainerInfo{
 		PodName:       getStringValueFromLabel(logger, labels, types.KubernetesPodNameLabel),
 		PodNamespace:  getStringValueFromLabel(logger, labels, types.KubernetesPodNamespaceLabel),
 		PodUID:        kubetypes.UID(getStringValueFromLabel(logger, labels, types.KubernetesPodUIDLabel)),
@@ -186,11 +191,24 @@ func getContainerInfoFromLabels(ctx context.Context, labels map[string]string) *
 	}
 }
 
+func getContainerHashFromAnnotations(ctx context.Context, annotations map[string]string) uint64 {
+	hash, err := getUint64ValueFromLabel(ctx, annotations, containerHashLabel)
+	if err != nil {
+		klog.FromContext(ctx).Error(err, "Unable to get label value from annotations", "label", containerHashLabel, "annotations", annotations)
+	}
+	return hash
+}
+
 // getContainerInfoFromAnnotations gets annotatedContainerInfo from annotations.
 func getContainerInfoFromAnnotations(ctx context.Context, annotations map[string]string) *annotatedContainerInfo {
+	info := getContainerInfoFromAnnotationsValue(ctx, annotations)
+	return &info
+}
+
+func getContainerInfoFromAnnotationsValue(ctx context.Context, annotations map[string]string) annotatedContainerInfo {
 	logger := klog.FromContext(ctx)
 	var err error
-	containerInfo := &annotatedContainerInfo{
+	containerInfo := annotatedContainerInfo{
 		TerminationMessagePath:   getStringValueFromLabel(logger, annotations, containerTerminationMessagePathLabel),
 		TerminationMessagePolicy: v1.TerminationMessagePolicy(getStringValueFromLabel(logger, annotations, containerTerminationMessagePolicyLabel)),
 	}
@@ -208,18 +226,22 @@ func getContainerInfoFromAnnotations(ctx context.Context, annotations map[string
 		logger.Error(err, "Unable to get label value from annotations", "label", podTerminationGracePeriodLabel, "annotations", annotations)
 	}
 
-	preStopHandler := &v1.LifecycleHandler{}
-	if found, err := getJSONObjectFromLabel(annotations, containerPreStopHandlerLabel, preStopHandler); err != nil {
-		logger.Error(err, "Unable to get label value from annotations", "label", containerPreStopHandlerLabel, "annotations", annotations)
-	} else if found {
-		containerInfo.PreStopHandler = preStopHandler
+	if _, found := annotations[containerPreStopHandlerLabel]; found {
+		preStopHandler := &v1.LifecycleHandler{}
+		if found, err := getJSONObjectFromLabel(annotations, containerPreStopHandlerLabel, preStopHandler); err != nil {
+			logger.Error(err, "Unable to get label value from annotations", "label", containerPreStopHandlerLabel, "annotations", annotations)
+		} else if found {
+			containerInfo.PreStopHandler = preStopHandler
+		}
 	}
 
-	containerPorts := []v1.ContainerPort{}
-	if found, err := getJSONObjectFromLabel(annotations, containerPortsLabel, &containerPorts); err != nil {
-		logger.Error(err, "Unable to get label value from annotations", "label", containerPortsLabel, "annotations", annotations)
-	} else if found {
-		containerInfo.ContainerPorts = containerPorts
+	if _, found := annotations[containerPortsLabel]; found {
+		var containerPorts []v1.ContainerPort
+		if found, err := getJSONObjectFromLabel(annotations, containerPortsLabel, &containerPorts); err != nil {
+			logger.Error(err, "Unable to get label value from annotations", "label", containerPortsLabel, "annotations", annotations)
+		} else if found {
+			containerInfo.ContainerPorts = containerPorts
+		}
 	}
 
 	return containerInfo

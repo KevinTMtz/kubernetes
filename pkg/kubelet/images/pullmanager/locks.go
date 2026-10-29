@@ -17,7 +17,7 @@ limitations under the License.
 package pullmanager
 
 import (
-	"hash/fnv"
+	"hash/maphash"
 	"sync"
 )
 
@@ -25,6 +25,8 @@ const (
 	minStripedLockSetSize int32 = 1
 	maxStripedLockSetSize int32 = 31
 )
+
+var stripeSeed = maphash.MakeSeed()
 
 // StripedLockSet allows context locking based on string keys, where each key
 // is mapped to a an index in a size-limited slice of locks.
@@ -66,7 +68,5 @@ func (s *StripedLockSet) GlobalUnlock() {
 }
 
 func keyToID(key string, sliceSize int32) uint32 {
-	h := fnv.New32()
-	h.Write([]byte(key))
-	return h.Sum32() % uint32(sliceSize)
+	return uint32(maphash.String(stripeSeed, key)) % uint32(sliceSize)
 }

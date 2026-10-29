@@ -193,19 +193,17 @@ func trimImageTagDigest(image string) (string, error) {
 	}
 
 	if len(digest) > 0 {
-		var foundDigest bool
-		image, foundDigest = strings.CutSuffix(image, "@"+digest)
-		if !foundDigest {
+		if len(image) <= len(digest) || image[len(image)-len(digest)-1] != '@' || !strings.HasSuffix(image, digest) {
 			return "", fmt.Errorf("digest was not specified last, this does not appear to be a valid image spec: %q", image)
 		}
+		image = image[:len(image)-len(digest)-1]
 	}
 
 	if len(tag) > 0 {
-		var tagFound bool
-		image, tagFound = strings.CutSuffix(image, ":"+tag)
-		if !tagFound {
+		if len(image) <= len(tag) || image[len(image)-len(tag)-1] != ':' || !strings.HasSuffix(image, tag) {
 			return "", fmt.Errorf("tag %q was not specified last (or before the digest), this does not appear to be a valid image spec: %q", tag, image)
 		}
+		image = image[:len(image)-len(tag)-1]
 	}
 
 	return image, nil

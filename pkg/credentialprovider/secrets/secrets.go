@@ -40,9 +40,12 @@ func MakeDockerKeyring(passedSecrets []v1.Secret, defaultKeyring credentialprovi
 }
 
 func secretsToTrackedDockerConfigs(secrets []v1.Secret) (credentialprovider.DockerKeyring, error) {
-	provider := &credentialprovider.BasicDockerKeyring{}
-	validSecretsFound := 0
-	for _, passedSecret := range secrets {
+	if len(secrets) == 0 {
+		return nil, nil
+	}
+	var provider *credentialprovider.BasicDockerKeyring
+	for i := range secrets {
+		passedSecret := &secrets[i]
 		if dockerConfigJSONBytes, dockerConfigJSONExists := passedSecret.Data[v1.DockerConfigJsonKey]; (passedSecret.Type == v1.SecretTypeDockerConfigJson) && dockerConfigJSONExists && (len(dockerConfigJSONBytes) > 0) {
 			dockerConfigJSON := credentialprovider.DockerConfigJSON{}
 			if err := json.Unmarshal(dockerConfigJSONBytes, &dockerConfigJSON); err != nil {
@@ -54,8 +57,10 @@ func secretsToTrackedDockerConfigs(secrets []v1.Secret) (credentialprovider.Dock
 				Namespace: passedSecret.Namespace,
 				Name:      passedSecret.Name}
 
+			if provider == nil {
+				provider = &credentialprovider.BasicDockerKeyring{}
+			}
 			provider.Add(&credentialprovider.CredentialSource{Secret: coords}, dockerConfigJSON.Auths)
-			validSecretsFound++
 		} else if dockercfgBytes, dockercfgExists := passedSecret.Data[v1.DockerConfigKey]; (passedSecret.Type == v1.SecretTypeDockercfg) && dockercfgExists && (len(dockercfgBytes) > 0) {
 			dockercfg := credentialprovider.DockerConfig{}
 			if err := json.Unmarshal(dockercfgBytes, &dockercfg); err != nil {
@@ -66,12 +71,14 @@ func secretsToTrackedDockerConfigs(secrets []v1.Secret) (credentialprovider.Dock
 				UID:       string(passedSecret.UID),
 				Namespace: passedSecret.Namespace,
 				Name:      passedSecret.Name}
+			if provider == nil {
+				provider = &credentialprovider.BasicDockerKeyring{}
+			}
 			provider.Add(&credentialprovider.CredentialSource{Secret: coords}, dockercfg)
-			validSecretsFound++
 		}
 	}
 
-	if validSecretsFound == 0 {
+	if provider == nil {
 		return nil, nil
 	}
 	return provider, nil

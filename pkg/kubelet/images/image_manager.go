@@ -42,7 +42,6 @@ import (
 	"k8s.io/kubernetes/pkg/kubelet/images/pullmanager"
 	"k8s.io/kubernetes/pkg/kubelet/metrics"
 	"k8s.io/kubernetes/pkg/util/parsers"
-	"k8s.io/utils/ptr"
 )
 
 func init() {
@@ -105,7 +104,7 @@ func NewImageManager(
 }
 
 // imagePullPrecheck inspects the pull policy and checks for image presence accordingly,
-// returning (imageRef, error msg, err) and logging any errors.
+// returning (imageRef, presentLocally metric label, error msg, err) and logging any errors.
 func (m *imageManager) imagePullPrecheck(
 	ctx context.Context,
 	objRef *v1.ObjectReference,
@@ -113,26 +112,30 @@ func (m *imageManager) imagePullPrecheck(
 	pullPolicy v1.PullPolicy,
 	spec *kubecontainer.ImageSpec,
 	requestedImage string,
-) (imageRef string, imageFound *bool, msg string, err error) {
+) (imageRef string, presentLocally string, msg string, err error) {
 	switch pullPolicy {
 	case v1.PullAlways:
-		return "", nil, msg, nil
+		return "", metricLabelUnknown, msg, nil
 	case v1.PullIfNotPresent, v1.PullNever:
 		imageRef, err = m.imageService.GetImageRef(ctx, *spec)
 		if err != nil {
 			msg = fmt.Sprintf("Failed to inspect image %q: %v", imageRef, err)
 			m.logIt(klog.FromContext(ctx), objRef, v1.EventTypeWarning, events.FailedToInspectImage, logPrefix, msg)
-			return "", nil, msg, ErrImageInspect
+			return "", metricLabelUnknown, msg, ErrImageInspect
 		}
 	}
 
-	imageFound = ptr.To(len(imageRef) > 0)
-	if !*imageFound && pullPolicy == v1.PullNever {
+	if len(imageRef) > 0 {
+		presentLocally = metricLabelTrue
+	} else {
+		presentLocally = metricLabelFalse
+	}
+	if len(imageRef) == 0 && pullPolicy == v1.PullNever {
 		msg, err = m.imageNotPresentOnNeverPolicyError(klog.FromContext(ctx), logPrefix, objRef, requestedImage)
-		return "", ptr.To(false), msg, err
+		return "", metricLabelFalse, msg, err
 	}
 
-	return imageRef, imageFound, msg, nil
+	return imageRef, presentLocally, msg, nil
 }
 
 // records an event using ref, event msg. Log using the provided logger when ref is nil.
@@ -142,7 +145,7 @@ func (m *imageManager) logIt(logger klog.Logger, objRef *v1.ObjectReference, eve
 		return
 	}
 
-	logMsg := fmt.Sprint(prefix, " ", msg)
+	logMsg := prefix + " " + msg
 	if eventtype == v1.EventTypeWarning {
 		logger.Error(nil, logMsg)
 		return
@@ -169,18 +172,19 @@ func (m *imageManager) imageNotPresentOnNeverPolicyError(logger klog.Logger, log
 // (imageRef, error message, error).
 func (m *imageManager) EnsureImageExists(ctx context.Context, objRef *v1.ObjectReference, pod *v1.Pod, requestedImage string, pullSecrets []v1.Secret, podSandboxConfig *runtimeapi.PodSandboxConfig, podRuntimeHandler string, pullPolicy v1.PullPolicy) (imageRef, message string, err error) {
 	logger := klog.FromContext(ctx)
-	logPrefix := fmt.Sprintf("%s/%s/%s", pod.Namespace, pod.Name, requestedImage)
+	var logPrefix string
+	if objRef == nil {
+		logPrefix = pod.Namespace + "/" + pod.Name + "/" + requestedImage
+	}
 
-	var ( // variables used to record metrics
-		imagePresentLocally *bool
-		imagePullRequired   *bool
-	)
+	presentLocally := metricLabelUnknown
+	pullRequired := metricLabelUnknown
 	defer func() {
-		recordEnsureImageRequest(pullPolicy, imagePresentLocally, imagePullRequired)
+		recordEnsureImageRequest(pullPolicy, presentLocally, pullRequired)
 	}()
 
 	// If the image contains no tag or digest, a default tag should be applied.
-	image, err := applyDefaultImageTag(requestedImage)
+	image, repoToPull, err := parseImageAndApplyDefaultTag(requestedImage)
 	if err != nil {
 		msg := fmt.Sprintf("Failed to apply default image tag %q: %v", requestedImage, err)
 		m.logIt(logger, objRef, v1.EventTypeWarning, events.FailedToInspectImage, logPrefix, msg)
@@ -188,11 +192,14 @@ func (m *imageManager) EnsureImageExists(ctx context.Context, objRef *v1.ObjectR
 	}
 
 	var podAnnotations []kubecontainer.Annotation
-	for k, v := range pod.GetAnnotations() {
-		podAnnotations = append(podAnnotations, kubecontainer.Annotation{
-			Name:  k,
-			Value: v,
-		})
+	if annotations := pod.GetAnnotations(); len(annotations) > 0 {
+		podAnnotations = make([]kubecontainer.Annotation, 0, len(annotations))
+		for k, v := range annotations {
+			podAnnotations = append(podAnnotations, kubecontainer.Annotation{
+				Name:  k,
+				Value: v,
+			})
+		}
 	}
 
 	spec := kubecontainer.ImageSpec{
@@ -201,54 +208,22 @@ func (m *imageManager) EnsureImageExists(ctx context.Context, objRef *v1.ObjectR
 		RuntimeHandler: podRuntimeHandler,
 	}
 
-	imageRef, imagePresentLocally, message, err = m.imagePullPrecheck(ctx, objRef, logPrefix, pullPolicy, &spec, requestedImage)
+	imageRef, presentLocally, message, err = m.imagePullPrecheck(ctx, objRef, logPrefix, pullPolicy, &spec, requestedImage)
 	if err != nil {
 		return "", message, err
 	}
 
-	// wrap the lookup in a function to ensure that we only look up credentials once and no earlier than needed
-	lookupPullCredentials := m.makeLookupPullCredentialsFunc(spec.Image, pod, pullSecrets, podSandboxConfig)
-
-	getPodCredentials := func() ([]kubeletconfiginternal.ImagePullSecret, *kubeletconfiginternal.ImagePullServiceAccount, error) {
-		pullCredentials, err := lookupPullCredentials()
-		if err != nil {
-			return nil, nil, err
-		}
-
-		var imagePullSecrets []kubeletconfiginternal.ImagePullSecret
-		// we don't take the audience of the service account into account, so there can only
-		// be one imagePullServiceAccount per pod when we try to make a decision.
-		var imagePullServiceAccount *kubeletconfiginternal.ImagePullServiceAccount
-		for _, s := range pullCredentials {
-			if s.Source == nil {
-				// we're only interested in creds that are not node accessible
-				continue
-			}
-			switch {
-			case s.Source.Secret != nil:
-				imagePullSecrets = append(imagePullSecrets, kubeletconfiginternal.ImagePullSecret{
-					UID:            s.Source.Secret.UID,
-					Name:           s.Source.Secret.Name,
-					Namespace:      s.Source.Secret.Namespace,
-					CredentialHash: s.AuthConfigHash,
-				})
-			case s.Source.ServiceAccount != nil && imagePullServiceAccount == nil:
-				imagePullServiceAccount = &kubeletconfiginternal.ImagePullServiceAccount{
-					UID:       s.Source.ServiceAccount.UID,
-					Name:      s.Source.ServiceAccount.Name,
-					Namespace: s.Source.ServiceAccount.Namespace,
-				}
-			}
-		}
-
-		return imagePullSecrets, imagePullServiceAccount, nil
-	}
+	var (
+		pullCredentials       []credentialprovider.TrackedAuthConfig
+		pullCredentialsErr    error
+		pullCredentialsLoaded bool
+	)
 
 	if imageRef != "" {
-		imagePullRequired = ptr.To(false) // should be overridden right after this if-block in case pull was required
+		pullRequired = metricLabelFalse // overridden right after this if-block in case pull was required
 
 		if !utilfeature.DefaultFeatureGate.Enabled(features.KubeletEnsureSecretPulledImages) {
-			msg := fmt.Sprintf("Container image %q already present on machine", requestedImage)
+			msg := "Container image \"" + requestedImage + "\" already present on machine"
 			m.logIt(logger, objRef, v1.EventTypeNormal, events.PulledImage, logPrefix, msg)
 
 			// we need to stop recording if it is still in progress, as the image
@@ -257,11 +232,53 @@ func (m *imageManager) EnsureImageExists(ctx context.Context, objRef *v1.ObjectR
 
 			return imageRef, msg, nil
 		}
-		if pullRequired, err := m.imagePullManager.MustAttemptImagePull(ctx, requestedImage, imageRef, getPodCredentials); err != nil {
-			imagePullRequired = nil
+
+		getPodCredentials := func() ([]kubeletconfiginternal.ImagePullSecret, *kubeletconfiginternal.ImagePullServiceAccount, error) {
+			if !pullCredentialsLoaded {
+				pullCredentials, pullCredentialsErr = m.lookupPullCredentials(repoToPull, pod, pullSecrets, podSandboxConfig)
+				pullCredentialsLoaded = true
+			}
+			if pullCredentialsErr != nil {
+				return nil, nil, pullCredentialsErr
+			}
+
+			var imagePullSecrets []kubeletconfiginternal.ImagePullSecret
+			// we don't take the audience of the service account into account, so there can only
+			// be one imagePullServiceAccount per pod when we try to make a decision.
+			var imagePullServiceAccount *kubeletconfiginternal.ImagePullServiceAccount
+			for _, s := range pullCredentials {
+				if s.Source == nil {
+					// we're only interested in creds that are not node accessible
+					continue
+				}
+				switch {
+				case s.Source.Secret != nil:
+					if imagePullSecrets == nil {
+						imagePullSecrets = make([]kubeletconfiginternal.ImagePullSecret, 0, len(pullCredentials))
+					}
+					imagePullSecrets = append(imagePullSecrets, kubeletconfiginternal.ImagePullSecret{
+						UID:            s.Source.Secret.UID,
+						Name:           s.Source.Secret.Name,
+						Namespace:      s.Source.Secret.Namespace,
+						CredentialHash: s.AuthConfigHash,
+					})
+				case s.Source.ServiceAccount != nil && imagePullServiceAccount == nil:
+					imagePullServiceAccount = &kubeletconfiginternal.ImagePullServiceAccount{
+						UID:       s.Source.ServiceAccount.UID,
+						Name:      s.Source.ServiceAccount.Name,
+						Namespace: s.Source.ServiceAccount.Namespace,
+					}
+				}
+			}
+
+			return imagePullSecrets, imagePullServiceAccount, nil
+		}
+
+		if mustPull, err := m.imagePullManager.MustAttemptImagePull(ctx, requestedImage, imageRef, getPodCredentials); err != nil {
+			pullRequired = metricLabelUnknown
 			return "", err.Error(), err
-		} else if !pullRequired {
-			msg := fmt.Sprintf("Container image %q already present on machine and can be accessed by the pod", requestedImage)
+		} else if !mustPull {
+			msg := "Container image \"" + requestedImage + "\" already present on machine and can be accessed by the pod"
 			m.logIt(logger, objRef, v1.EventTypeNormal, events.PulledImage, logPrefix, msg)
 
 			// we need to stop recording if it is still in progress, as the image
@@ -271,7 +288,7 @@ func (m *imageManager) EnsureImageExists(ctx context.Context, objRef *v1.ObjectR
 			return imageRef, msg, nil
 		}
 	}
-	imagePullRequired = ptr.To(true)
+	pullRequired = metricLabelTrue
 
 	if pullPolicy == v1.PullNever {
 		// The image is present as confirmed by imagePullPrecheck but it apparently
@@ -280,45 +297,40 @@ func (m *imageManager) EnsureImageExists(ctx context.Context, objRef *v1.ObjectR
 		return "", msg, err
 	}
 
-	pullCredentials, err := lookupPullCredentials()
-	if err != nil {
-		return "", err.Error(), err
+	if !pullCredentialsLoaded {
+		pullCredentials, pullCredentialsErr = m.lookupPullCredentials(repoToPull, pod, pullSecrets, podSandboxConfig)
+	}
+	if pullCredentialsErr != nil {
+		return "", pullCredentialsErr.Error(), pullCredentialsErr
 	}
 
 	return m.pullImage(ctx, logPrefix, objRef, pod.UID, requestedImage, spec, pullCredentials, podSandboxConfig)
 }
 
-func (m *imageManager) makeLookupPullCredentialsFunc(image string, pod *v1.Pod, pullSecrets []v1.Secret, podSandboxConfig *runtimeapi.PodSandboxConfig) func() ([]credentialprovider.TrackedAuthConfig, error) {
-	return sync.OnceValues(func() ([]credentialprovider.TrackedAuthConfig, error) {
-		repoToPull, _, _, err := parsers.ParseImageName(image)
-		if err != nil {
-			return nil, err
-		}
+func (m *imageManager) lookupPullCredentials(repoToPull string, pod *v1.Pod, pullSecrets []v1.Secret, podSandboxConfig *runtimeapi.PodSandboxConfig) ([]credentialprovider.TrackedAuthConfig, error) {
+	// construct the dynamic keyring using the providers we have in the kubelet
+	var podName, podNamespace, podUID string
+	if utilfeature.DefaultFeatureGate.Enabled(features.KubeletServiceAccountTokenForCredentialProviders) {
+		sandboxMetadata := podSandboxConfig.GetMetadata()
 
-		// construct the dynamic keyring using the providers we have in the kubelet
-		var podName, podNamespace, podUID string
-		if utilfeature.DefaultFeatureGate.Enabled(features.KubeletServiceAccountTokenForCredentialProviders) {
-			sandboxMetadata := podSandboxConfig.GetMetadata()
+		podName = sandboxMetadata.Name
+		podNamespace = sandboxMetadata.Namespace
+		podUID = sandboxMetadata.Uid
+	}
 
-			podName = sandboxMetadata.Name
-			podNamespace = sandboxMetadata.Namespace
-			podUID = sandboxMetadata.Uid
-		}
+	externalCredentialProviderKeyring := credentialproviderplugin.NewExternalCredentialProviderDockerKeyring(
+		podNamespace,
+		podName,
+		podUID,
+		pod.Spec.ServiceAccountName)
 
-		externalCredentialProviderKeyring := credentialproviderplugin.NewExternalCredentialProviderDockerKeyring(
-			podNamespace,
-			podName,
-			podUID,
-			pod.Spec.ServiceAccountName)
+	keyring, err := credentialprovidersecrets.MakeDockerKeyring(pullSecrets, credentialprovider.UnionDockerKeyring{m.nodeKeyring, externalCredentialProviderKeyring})
+	if err != nil {
+		return nil, err
+	}
 
-		keyring, err := credentialprovidersecrets.MakeDockerKeyring(pullSecrets, credentialprovider.UnionDockerKeyring{m.nodeKeyring, externalCredentialProviderKeyring})
-		if err != nil {
-			return nil, err
-		}
-
-		pullCredentials, _ := keyring.Lookup(repoToPull)
-		return pullCredentials, nil
-	})
+	pullCredentials, _ := keyring.Lookup(repoToPull)
+	return pullCredentials, nil
 }
 
 func (m *imageManager) pullImage(ctx context.Context, logPrefix string, objRef *v1.ObjectReference, podUID types.UID, image string, imgSpec kubecontainer.ImageSpec, pullCredentials []credentialprovider.TrackedAuthConfig, podSandboxConfig *runtimeapi.PodSandboxConfig) (imageRef, message string, err error) {
@@ -340,7 +352,7 @@ func (m *imageManager) pullImage(ctx context.Context, logPrefix string, objRef *
 		}()
 	}
 
-	backOffKey := fmt.Sprintf("%s_%s", podUID, image)
+	backOffKey := string(podUID) + "_" + image
 	if m.backOff.IsInBackOffSinceUpdate(backOffKey, m.backOff.Clock.Now()) {
 		msg := fmt.Sprintf("Back-off pulling image %q", image)
 		m.logIt(logger, objRef, v1.EventTypeNormal, events.BackOffPullImage, logPrefix, msg)
@@ -422,9 +434,14 @@ func evalCRIPullErr(imgRef string, err error) (errMsg string, errRes error) {
 // applyDefaultImageTag parses a docker image string, if it doesn't contain any tag or digest,
 // a default tag will be applied.
 func applyDefaultImageTag(image string) (string, error) {
-	_, tag, digest, err := parsers.ParseImageName(image)
+	appliedImage, _, err := parseImageAndApplyDefaultTag(image)
+	return appliedImage, err
+}
+
+func parseImageAndApplyDefaultTag(image string) (string, string, error) {
+	repoToPull, tag, digest, err := parsers.ParseImageName(image)
 	if err != nil {
-		return "", err
+		return "", "", err
 	}
 	// we just concatenate the image name with the default tag here instead
 	if len(digest) == 0 && len(tag) > 0 && !strings.HasSuffix(image, ":"+tag) {
@@ -435,7 +452,7 @@ func applyDefaultImageTag(image string) (string, error) {
 		// agnostic wrt image names and default hostnames.
 		image = image + ":" + tag
 	}
-	return image, nil
+	return image, repoToPull, nil
 }
 
 func trackedToImagePullCreds(trackedCreds *credentialprovider.TrackedAuthConfig) *kubeletconfiginternal.ImagePullCredentials {

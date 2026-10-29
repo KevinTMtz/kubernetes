@@ -28,6 +28,10 @@ import (
 // This file contains help function to kuberuntime types to CRI runtime API types, or vice versa.
 
 func ToKubeContainerImageSpec(image *runtimeapi.Image) kubecontainer.ImageSpec {
+	return toKubeContainerImageSpec(image, utilfeature.DefaultFeatureGate.Enabled(features.RuntimeClassInImageCriAPI))
+}
+
+func toKubeContainerImageSpec(image *runtimeapi.Image, runtimeClassEnabled bool) kubecontainer.ImageSpec {
 	var annotations []kubecontainer.Annotation
 
 	if image.Spec != nil && len(image.Spec.Annotations) > 0 {
@@ -36,6 +40,7 @@ func ToKubeContainerImageSpec(image *runtimeapi.Image) kubecontainer.ImageSpec {
 			annotationKeys = append(annotationKeys, k)
 		}
 		sort.Strings(annotationKeys)
+		annotations = make([]kubecontainer.Annotation, 0, len(annotationKeys))
 		for _, k := range annotationKeys {
 			annotations = append(annotations, kubecontainer.Annotation{
 				Name:  k,
@@ -49,7 +54,7 @@ func ToKubeContainerImageSpec(image *runtimeapi.Image) kubecontainer.ImageSpec {
 		Annotations: annotations,
 	}
 	// if RuntimeClassInImageCriAPI feature gate is enabled, set runtimeHandler CRI field
-	if utilfeature.DefaultFeatureGate.Enabled(features.RuntimeClassInImageCriAPI) {
+	if runtimeClassEnabled {
 		runtimeHandler := ""
 		if image.Spec != nil {
 			runtimeHandler = image.Spec.RuntimeHandler
@@ -61,7 +66,7 @@ func ToKubeContainerImageSpec(image *runtimeapi.Image) kubecontainer.ImageSpec {
 }
 
 func ToRuntimeAPIImageSpec(imageSpec kubecontainer.ImageSpec) *runtimeapi.ImageSpec {
-	var annotations = make(map[string]string)
+	var annotations = make(map[string]string, len(imageSpec.Annotations))
 	if imageSpec.Annotations != nil {
 		for _, a := range imageSpec.Annotations {
 			annotations[a.Name] = a.Value
@@ -78,4 +83,14 @@ func ToRuntimeAPIImageSpec(imageSpec kubecontainer.ImageSpec) *runtimeapi.ImageS
 	}
 
 	return &spec
+}
+
+func toRuntimeAPIImageStatusSpec(imageSpec kubecontainer.ImageSpec) *runtimeapi.ImageSpec {
+	spec := &runtimeapi.ImageSpec{
+		Image: imageSpec.Image,
+	}
+	if utilfeature.DefaultFeatureGate.Enabled(features.RuntimeClassInImageCriAPI) {
+		spec.RuntimeHandler = imageSpec.RuntimeHandler
+	}
+	return spec
 }

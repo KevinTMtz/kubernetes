@@ -90,7 +90,9 @@ func (d *CachingDockerConfigProvider) Provide(image string) DockerConfig {
 		return d.cacheDockerConfig
 	}
 
-	klog.V(2).Infof("Refreshing cache for provider: %v", reflect.TypeOf(d.Provider).String())
+	if klog.V(2).Enabled() {
+		klog.V(2).Infof("Refreshing cache for provider: %v", reflect.TypeOf(d.Provider).String())
+	}
 	config := d.Provider.Provide(image)
 	if d.ShouldCache == nil || d.ShouldCache(config) {
 		d.cacheDockerConfig = config

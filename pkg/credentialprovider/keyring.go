@@ -23,10 +23,9 @@ import (
 	"net"
 	"net/url"
 	"path/filepath"
-	"sort"
+	"slices"
 	"strings"
 
-	"k8s.io/apimachinery/pkg/util/sets"
 	utilfeature "k8s.io/apiserver/pkg/util/feature"
 	"k8s.io/klog/v2"
 	"k8s.io/kubernetes/pkg/features"
@@ -130,9 +129,10 @@ type AuthConfig struct {
 // `src` is nil if the docker config is globally available on the node.
 func (dk *BasicDockerKeyring) Add(src *CredentialSource, cfgs DockerConfig) {
 	if dk.index == nil {
-		dk.index = make([]string, 0)
-		dk.creds = make(map[string][]TrackedAuthConfig)
+		dk.index = make([]string, 0, len(cfgs))
+		dk.creds = make(map[string][]TrackedAuthConfig, len(cfgs))
 	}
+	ensureSecretPulledImages := utilfeature.DefaultFeatureGate.Enabled(features.KubeletEnsureSecretPulledImages)
 	for repository, dockerAuthCfg := range cfgs {
 		creds := AuthConfig{
 			Username: dockerAuthCfg.Username,
@@ -165,20 +165,28 @@ func (dk *BasicDockerKeyring) Add(src *CredentialSource, cfgs DockerConfig) {
 		} else {
 			key = parsed.Host
 		}
-		trackedCreds := NewTrackedAuthConfig(&creds, src)
+		trackedCreds := TrackedAuthConfig{
+			AuthConfig: creds,
+		}
+		if ensureSecretPulledImages {
+			trackedCreds.Source = src
+			trackedCreds.AuthConfigHash = hashAuthConfig(&creds)
+		}
 
-		dk.creds[key] = append(dk.creds[key], *trackedCreds)
-		dk.index = append(dk.index, key)
+		if _, exists := dk.creds[key]; !exists {
+			dk.index = append(dk.index, key)
+		}
+		dk.creds[key] = append(dk.creds[key], trackedCreds)
 	}
-
-	eliminateDupes := sets.NewString(dk.index...)
-	dk.index = eliminateDupes.List()
 
 	// Update the index used to identify which credentials to use for a given
 	// image. The index is reverse-sorted so more specific paths are matched
 	// first. For example, if for the given image "gcr.io/etcd-development/etcd",
 	// credentials for "quay.io/coreos" should match before "quay.io".
-	sort.Sort(sort.Reverse(sort.StringSlice(dk.index)))
+	slices.SortFunc(dk.index, func(a, b string) int {
+		return strings.Compare(b, a)
+	})
+	dk.index = slices.Compact(dk.index)
 }
 
 const (
@@ -190,18 +198,18 @@ const (
 // pull from the default registry (DockerHub) based on the
 // characteristics of its name.
 func isDefaultRegistryMatch(image string) bool {
-	parts := strings.SplitN(image, "/", 2)
+	firstPart, _, hasSlash := strings.Cut(image, "/")
 
-	if len(parts[0]) == 0 {
+	if len(firstPart) == 0 {
 		return false
 	}
 
-	if len(parts) == 1 {
+	if !hasSlash {
 		// e.g. library/ubuntu
 		return true
 	}
 
-	if parts[0] == "docker.io" || parts[0] == "index.docker.io" {
+	if firstPart == "docker.io" || firstPart == "index.docker.io" {
 		// resolve docker.io/image and index.docker.io/image as default registry
 		return true
 	}
@@ -210,7 +218,7 @@ func isDefaultRegistryMatch(image string) bool {
 	// Docker looks for either a “.” (domain separator) or “:” (port separator)
 	// to learn that the first part of the repository name is a location and not
 	// a user name.
-	return !strings.ContainsAny(parts[0], ".:")
+	return !strings.ContainsAny(firstPart, ".:")
 }
 
 // ParseSchemelessURL parses a schemeless url and returns a url.URL
@@ -228,10 +236,11 @@ func ParseSchemelessURL(schemelessURL string) (*url.URL, error) {
 
 // SplitURL splits the host name into parts, as well as the port
 func SplitURL(url *url.URL) (parts []string, port string) {
-	host, port, err := net.SplitHostPort(url.Host)
-	if err != nil {
-		// could not parse port
-		host, port = url.Host, ""
+	host := url.Host
+	if strings.Contains(host, ":") {
+		if h, p, err := net.SplitHostPort(host); err == nil {
+			host, port = h, p
+		}
 	}
 	return strings.Split(host, "."), port
 }
@@ -259,18 +268,26 @@ func URLsMatchStr(glob string, target string) (bool, error) {
 //
 // Note that we don't support wildcards in ports and paths yet.
 func URLsMatch(globURL *url.URL, targetURL *url.URL) (bool, error) {
-	globURLParts, globPort := SplitURL(globURL)
+	if !strings.HasPrefix(targetURL.Path, globURL.Path) {
+		// the path of the credential must be a prefix
+		return false, nil
+	}
 	targetURLParts, targetPort := SplitURL(targetURL)
+	return urlMatchesParsedTarget(globURL, targetURL.Path, targetURLParts, targetPort)
+}
+
+func urlMatchesParsedTarget(globURL *url.URL, targetPath string, targetURLParts []string, targetPort string) (bool, error) {
+	if !strings.HasPrefix(targetPath, globURL.Path) {
+		// the path of the credential must be a prefix
+		return false, nil
+	}
+	globURLParts, globPort := SplitURL(globURL)
 	if globPort != targetPort {
 		// port doesn't match
 		return false, nil
 	}
 	if len(globURLParts) != len(targetURLParts) {
 		// host name does not have the same number of parts
-		return false, nil
-	}
-	if !strings.HasPrefix(targetURL.Path, globURL.Path) {
-		// the path of the credential must be a prefix
 		return false, nil
 	}
 	for k, globURLPart := range globURLParts {
@@ -294,11 +311,20 @@ func URLsMatch(globURL *url.URL, targetURL *url.URL) (bool, error) {
 func (dk *BasicDockerKeyring) Lookup(image string) ([]TrackedAuthConfig, bool) {
 	// range over the index as iterating over a map does not provide a predictable ordering
 	ret := []TrackedAuthConfig{}
-	for _, k := range dk.index {
-		// both k and image are schemeless URLs because even though schemes are allowed
-		// in the credential configurations, we remove them in Add.
-		if matched, _ := URLsMatchStr(k, image); matched {
-			ret = append(ret, dk.creds[k]...)
+	if len(dk.index) > 0 {
+		if targetURL, err := ParseSchemelessURL(image); err == nil {
+			targetURLParts, targetPort := SplitURL(targetURL)
+			for _, k := range dk.index {
+				// both k and image are schemeless URLs because even though schemes are allowed
+				// in the credential configurations, we remove them in Add.
+				globURL, err := ParseSchemelessURL(k)
+				if err != nil {
+					continue
+				}
+				if matched, _ := urlMatchesParsedTarget(globURL, targetURL.Path, targetURLParts, targetPort); matched {
+					ret = append(ret, dk.creds[k]...)
+				}
+			}
 		}
 	}
 
@@ -307,10 +333,8 @@ func (dk *BasicDockerKeyring) Lookup(image string) ([]TrackedAuthConfig, bool) {
 	}
 
 	// Use credentials for the default registry if provided, and appropriate
-	if isDefaultRegistryMatch(image) {
-		if auth, ok := dk.creds[defaultRegistryHost]; ok {
-			return auth, true
-		}
+	if auth, ok := dk.creds[defaultRegistryHost]; ok && isDefaultRegistryMatch(image) {
+		return auth, true
 	}
 
 	return []TrackedAuthConfig{}, false
@@ -365,7 +389,6 @@ func hashAuthConfig(creds *AuthConfig) string {
 		return ""
 	}
 
-	hash := sha256.New()
-	hash.Write([]byte(credBytes))
-	return hex.EncodeToString(hash.Sum(nil))
+	sum := sha256.Sum256(credBytes)
+	return hex.EncodeToString(sum[:])
 }

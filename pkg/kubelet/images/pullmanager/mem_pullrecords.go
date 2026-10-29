@@ -27,32 +27,29 @@ import (
 )
 
 type lruCache[K comparable, V any] struct {
+	mu      sync.Mutex
 	cache   *lru.Cache
 	maxSize int
 
 	// authoritative indicates if we can consider the cached records an
 	// authoritative source.
-	// False if the cache is evicted any records because it reached capacity, or
+	// False if the cache evicted any records because it reached capacity, or
 	// if there were errors during its initialization.
 	authoritative atomic.Bool
 
-	// deletingKeys is used by the eviction function to distinguish between keys
-	// being explicitly deleted and keys being removed because the cache was too
-	// large or being cleared.
-	//
-	// This is only modified by lruCache.Delete().
-	deletingKeys sync.Map
+	// deleting is set under mu during explicit Delete() calls so the eviction
+	// callback can distinguish explicit deletions from capacity evictions.
+	deleting bool
 }
 
 func newLRUCache[K comparable, V any](size int) *lruCache[K, V] {
 	c := lru.New(size)
 	l := &lruCache[K, V]{
-		maxSize:      size,
-		cache:        c,
-		deletingKeys: sync.Map{},
+		maxSize: size,
+		cache:   c,
 	}
-	if err := c.SetEvictionFunc(func(key lru.Key, _ any) {
-		if _, shouldIgnore := l.deletingKeys.Load(key); shouldIgnore {
+	if err := c.SetEvictionFunc(func(_ lru.Key, _ any) {
+		if l.deleting {
 			return
 		}
 		// any eviction makes our cache non-authoritative
@@ -64,7 +61,9 @@ func newLRUCache[K comparable, V any](size int) *lruCache[K, V] {
 }
 
 func (c *lruCache[K, V]) Get(key K) (*V, bool) {
+	c.mu.Lock()
 	value, found := c.cache.Get(key)
+	c.mu.Unlock()
 	if !found {
 		return nil, false
 	}
@@ -74,17 +73,33 @@ func (c *lruCache[K, V]) Get(key K) (*V, bool) {
 	return value.(*V), true
 }
 
-func (c *lruCache[K, V]) Set(key K, value *V) { c.cache.Add(key, value) }
-func (c *lruCache[K, V]) Len() int            { return c.cache.Len() }
-func (c *lruCache[K, V]) Clear()              { c.cache.Clear() }
+func (c *lruCache[K, V]) Set(key K, value *V) {
+	c.mu.Lock()
+	c.cache.Add(key, value)
+	c.mu.Unlock()
+}
+
+func (c *lruCache[K, V]) Len() int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.cache.Len()
+}
+
+func (c *lruCache[K, V]) Clear() {
+	c.mu.Lock()
+	c.cache.Clear()
+	c.mu.Unlock()
+}
 
 // Delete will prevent authoritative cache status changes.
 //
 // Must be called locked with an external write lock on `key`.
 func (c *lruCache[K, V]) Delete(key K) {
-	c.deletingKeys.Store(key, struct{}{})
-	defer c.deletingKeys.Delete(key)
+	c.mu.Lock()
+	c.deleting = true
 	c.cache.Remove(key)
+	c.deleting = false
+	c.mu.Unlock()
 }
 
 // cachedPullRecordsAccessor implements a write-through cache layer on top

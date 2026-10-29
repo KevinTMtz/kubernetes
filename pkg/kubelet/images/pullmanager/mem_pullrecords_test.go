@@ -970,10 +970,9 @@ func Test_cachedPullRecordsAccessor_DeleteImagePullIntent(t *testing.T) {
 					t.Errorf("cachedPullRecordsAccessor.DeleteImagePullIntent() error = %v, wantErr %v", err, tt.wantErr)
 				}
 
-				c.intents.deletingKeys.Range(func(key any, _ any) bool {
-					t.Errorf("key '%v' should no longer be present in the cache.ignoreEvictionKeys map", key)
-					return true
-				})
+				if c.intents.deleting {
+					t.Errorf("cache.deleting should be false after Delete()")
+				}
 
 				if err := cmpRecordsMapAndCache(tt.wantIntents, c.intents); err != nil {
 					t.Errorf("cachedPullRecordsAccessor.DeleteImagePullIntent() expected cache state differs: %v", err)
@@ -1039,10 +1038,9 @@ func Test_cachedPullRecordsAccessor_DeleteImagePulledRecord(t *testing.T) {
 					t.Errorf("cachedPullRecordsAccessor.DeleteImagePulledRecord() error = %v, wantErr %v", err, tt.wantErr)
 				}
 
-				c.pulledRecords.deletingKeys.Range(func(key any, _ any) bool {
-					t.Errorf("key '%v' should no longer be present in the cache.ignoreEvictionKeys map", key)
-					return true
-				})
+				if c.pulledRecords.deleting {
+					t.Errorf("cache.deleting should be false after Delete()")
+				}
 
 				if err := cmpRecordsMapAndCache(tt.wantPulledRecords, c.pulledRecords); err != nil {
 					t.Errorf("cachedPullRecordsAccessor.DeleteImagePulledRecord() expected cache state differs: %v", err)

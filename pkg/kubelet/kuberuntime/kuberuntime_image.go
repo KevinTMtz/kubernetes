@@ -74,7 +74,7 @@ func (m *kubeGenericRuntimeManager) PullImage(ctx context.Context, image kubecon
 // the local storage. It returns ("", nil) if the image isn't in the local storage.
 func (m *kubeGenericRuntimeManager) GetImageRef(ctx context.Context, image kubecontainer.ImageSpec) (string, error) {
 	logger := klog.FromContext(ctx)
-	resp, err := m.imageService.ImageStatus(ctx, ToRuntimeAPIImageSpec(image), false)
+	resp, err := m.imageService.ImageStatus(ctx, toRuntimeAPIImageStatusSpec(image), false)
 	if err != nil {
 		logger.Error(err, "Failed to get image status", "image", image.Image)
 		return "", err
@@ -87,7 +87,7 @@ func (m *kubeGenericRuntimeManager) GetImageRef(ctx context.Context, image kubec
 
 func (m *kubeGenericRuntimeManager) GetImageSize(ctx context.Context, image kubecontainer.ImageSpec) (uint64, error) {
 	logger := klog.FromContext(ctx)
-	resp, err := m.imageService.ImageStatus(ctx, ToRuntimeAPIImageSpec(image), false)
+	resp, err := m.imageService.ImageStatus(ctx, toRuntimeAPIImageStatusSpec(image), false)
 	if err != nil {
 		logger.Error(err, "Failed to get image status", "image", image.Image)
 		return 0, err
@@ -109,13 +109,17 @@ func (m *kubeGenericRuntimeManager) ListImages(ctx context.Context) ([]kubeconta
 		return nil, err
 	}
 
+	if len(allImages) > 0 {
+		images = make([]kubecontainer.Image, 0, len(allImages))
+	}
+	runtimeClassEnabled := utilfeature.DefaultFeatureGate.Enabled(features.RuntimeClassInImageCriAPI)
 	for _, img := range allImages {
 		// Container runtimes may choose not to implement changes needed for KEP 4216. If
 		// the changes are not implemented by a container runtime, the exisiting behavior
 		// of not populating the runtimeHandler CRI field in ImageSpec struct is preserved.
 		// Therefore, when RuntimeClassInImageCriAPI feature gate is set, check to see if this
 		// field is empty and log a warning message.
-		if utilfeature.DefaultFeatureGate.Enabled(features.RuntimeClassInImageCriAPI) {
+		if runtimeClassEnabled {
 			if img.Spec == nil || (img.Spec != nil && img.Spec.RuntimeHandler == "") {
 				logger.V(2).Info("WARNING: RuntimeHandler is empty", "ImageID", img.Id)
 			}
@@ -126,7 +130,7 @@ func (m *kubeGenericRuntimeManager) ListImages(ctx context.Context) ([]kubeconta
 			Size:        int64(img.Size),
 			RepoTags:    img.RepoTags,
 			RepoDigests: img.RepoDigests,
-			Spec:        ToKubeContainerImageSpec(img),
+			Spec:        toKubeContainerImageSpec(img, runtimeClassEnabled),
 			Pinned:      img.Pinned,
 		})
 	}

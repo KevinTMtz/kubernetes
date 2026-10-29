@@ -37,6 +37,7 @@ import (
 	kubetypes "k8s.io/apimachinery/pkg/types"
 	utilerrors "k8s.io/apimachinery/pkg/util/errors"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
+	"k8s.io/apimachinery/pkg/util/sets"
 	utilversion "k8s.io/apimachinery/pkg/util/version"
 	utilfeature "k8s.io/apiserver/pkg/util/feature"
 	"k8s.io/client-go/tools/record"
@@ -466,8 +467,11 @@ func (m *kubeGenericRuntimeManager) GetPods(ctx context.Context, all bool) ([]*k
 
 	// Convert map to list.
 	var result []*kubecontainer.Pod
-	for _, pod := range pods {
-		result = append(result, pod)
+	if len(pods) > 0 {
+		result = make([]*kubecontainer.Pod, 0, len(pods))
+		for _, pod := range pods {
+			result = append(result, pod)
+		}
 	}
 
 	// There are scenarios where multiple pods are running in parallel having
@@ -484,12 +488,12 @@ func (m *kubeGenericRuntimeManager) GetPods(ctx context.Context, all bool) ([]*k
 
 func (m *kubeGenericRuntimeManager) getPods(ctx context.Context, opts listOptions) (map[kubetypes.UID]*kubecontainer.Pod, error) {
 	logger := klog.FromContext(ctx)
-	pods := make(map[kubetypes.UID]*kubecontainer.Pod)
 	timestamp := time.Now()
 	sandboxes, err := m.getSandboxes(ctx, opts)
 	if err != nil {
 		return nil, err
 	}
+	pods := make(map[kubetypes.UID]*kubecontainer.Pod, len(sandboxes))
 	// Sort sandboxes by creation time, newest first.
 	sort.Sort(podSandboxByCreatedThenID(sandboxes))
 	for i := range sandboxes {
@@ -535,7 +539,7 @@ func (m *kubeGenericRuntimeManager) getPods(ctx context.Context, opts listOption
 			continue
 		}
 
-		labelledInfo := getContainerInfoFromLabels(ctx, c.Labels)
+		labelledInfo := getContainerInfoFromLabelsValue(ctx, c.Labels)
 		pod, found := pods[labelledInfo.PodUID]
 		if !found {
 			pod = &kubecontainer.Pod{
@@ -2326,6 +2330,41 @@ func (m *kubeGenericRuntimeManager) GetContainerStatus(ctx context.Context, podU
 	}
 
 	return m.convertToKubeContainerStatus(ctx, podUID, status), nil
+}
+
+// RecordContainerImageVolumeMounts inspects CRI container mounts directly and records
+// any mounted image IDs in imagesInUse without constructing a full kubecontainer.Status.
+func (m *kubeGenericRuntimeManager) RecordContainerImageVolumeMounts(ctx context.Context, id kubecontainer.ContainerID, podNamespace, podName, containerName string, images []kubecontainer.Image, imagesInUse sets.Set[string]) error {
+	resp, err := m.runtimeService.ContainerStatus(ctx, id.ID, false)
+	if err != nil {
+		return fmt.Errorf("runtime container status: %w", err)
+	}
+
+	status := resp.GetStatus()
+	if status == nil {
+		return remote.ErrContainerStatusNil
+	}
+
+	if len(status.Mounts) == 0 {
+		return nil
+	}
+
+	v5Logger := klog.FromContext(ctx).V(5)
+	v5Enabled := v5Logger.Enabled()
+	for _, mount := range status.Mounts {
+		if mount.Image == nil || mount.Image.Image == "" {
+			continue
+		}
+		for _, image := range images {
+			if mount.Image.Image == image.ID {
+				if v5Enabled {
+					v5Logger.Info("Container uses image as mount", "pod", klog.KRef(podNamespace, podName), "containerName", containerName, "imageID", image.ID)
+				}
+				imagesInUse.Insert(image.ID)
+			}
+		}
+	}
+	return nil
 }
 
 // GarbageCollect removes dead containers using the specified container gc policy.

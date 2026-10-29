@@ -59,9 +59,15 @@ type externalCredentialProviderKeyring struct {
 	providers []dockerConfigProviderWithCoordinates
 }
 
+var emptyExternalKeyring = &externalCredentialProviderKeyring{}
+
 func NewExternalCredentialProviderDockerKeyring(podNamespace, podName, podUID, serviceAccountName string) credentialprovider.DockerKeyring {
 	providersMutex.RLock()
 	defer providersMutex.RUnlock()
+
+	if len(providers) == 0 {
+		return emptyExternalKeyring
+	}
 
 	keyring := &externalCredentialProviderKeyring{
 		providers: make([]dockerConfigProviderWithCoordinates, 0, len(providers)),
@@ -89,6 +95,10 @@ func NewExternalCredentialProviderDockerKeyring(podNamespace, podName, podUID, s
 }
 
 func (k *externalCredentialProviderKeyring) Lookup(image string) ([]credentialprovider.TrackedAuthConfig, bool) {
+	if len(k.providers) == 0 {
+		return []credentialprovider.TrackedAuthConfig{}, false
+	}
+
 	keyring := &credentialprovider.BasicDockerKeyring{}
 
 	for _, p := range k.providers {

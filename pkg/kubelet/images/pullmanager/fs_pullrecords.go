@@ -19,6 +19,7 @@ package pullmanager
 import (
 	"bytes"
 	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
@@ -26,6 +27,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/serializer"
@@ -44,6 +46,18 @@ const (
 
 var encodeVersion = kubeletconfigv1beta1.SchemeGroupVersion
 
+var encodeBufferPool = sync.Pool{
+	New: func() any {
+		return bytes.NewBuffer(make([]byte, 0, 1024))
+	},
+}
+
+type cachedPulledRecordEntry struct {
+	rawHash [sha256.Size]byte
+	rawLen  int
+	record  *kubeletconfiginternal.ImagePulledRecord
+}
+
 var _ PullRecordsAccessor = &fsPullRecordsAccessor{}
 
 // fsPullRecordsAccessor uses the filesystem to read/write ImagePullIntent/ImagePulledRecord
@@ -54,6 +68,16 @@ type fsPullRecordsAccessor struct {
 
 	encoder runtime.Encoder
 	decoder runtime.Decoder
+
+	mu                sync.Mutex
+	countsInitialized bool
+	pullingFiles      map[string]struct{}
+	pulledFiles       map[string]struct{}
+	// pulledRecords caches decoded ImagePulledRecord snapshots keyed by cache filename
+	// and verified against the on-disk file's length and SHA-256 digest. Callers treat
+	// returned *ImagePulledRecord values as read-only (DeepCopying before mutation),
+	// matching cachedPullRecordsAccessor.
+	pulledRecords map[string]cachedPulledRecordEntry
 }
 
 // NewFSPullRecordsAccessor returns an accessor for the ImagePullIntent/ImagePulledRecord
@@ -70,6 +94,10 @@ func NewFSPullRecordsAccessor(logger klog.Logger, kubeletDir string) (PullRecord
 
 		encoder: kubeletConfigEncoder,
 		decoder: kubeletConfigDecoder,
+
+		pullingFiles:  make(map[string]struct{}),
+		pulledFiles:   make(map[string]struct{}),
+		pulledRecords: make(map[string]cachedPulledRecordEntry),
 	}
 
 	if err := os.MkdirAll(accessor.pullingDir, 0700); err != nil {
@@ -81,12 +109,22 @@ func NewFSPullRecordsAccessor(logger klog.Logger, kubeletDir string) (PullRecord
 	}
 
 	accessor.recordsVersionMigration(logger)
+	accessor.mu.Lock()
+	accessor.countsInitialized = true
+	accessor.mu.Unlock()
 	return NewMeteringRecordsAccessor(accessor, fsPullIntentsSize, fsPulledRecordsSize), nil
 }
 
 func (f *fsPullRecordsAccessor) recordsVersionMigration(logger klog.Logger) {
 	err := processDirFiles(f.pullingDir,
 		func(filePath string, fileContent []byte) error {
+			filename := filepath.Base(filePath)
+			f.mu.Lock()
+			if f.pullingFiles != nil {
+				f.pullingFiles[filename] = struct{}{}
+			}
+			f.mu.Unlock()
+
 			intent, isCurrentVersion, err := decodeIntent(f.decoder, fileContent)
 			if err != nil {
 				return fmt.Errorf("failed to decode ImagePullIntent from file %q: %w", filePath, err)
@@ -103,6 +141,13 @@ func (f *fsPullRecordsAccessor) recordsVersionMigration(logger klog.Logger) {
 	}
 	err = processDirFiles(f.pulledDir,
 		func(filePath string, fileContent []byte) error {
+			filename := filepath.Base(filePath)
+			f.mu.Lock()
+			if f.pulledFiles != nil {
+				f.pulledFiles[filename] = struct{}{}
+			}
+			f.mu.Unlock()
+
 			pullRecord, isCurrentVersion, err := decodePulledRecord(f.decoder, fileContent)
 			if err != nil {
 				return fmt.Errorf("failed to decode ImagePulledRecord from file %q: %w", filePath, err)
@@ -111,6 +156,18 @@ func (f *fsPullRecordsAccessor) recordsVersionMigration(logger klog.Logger) {
 				if err := f.WriteImagePulledRecord(logger, pullRecord); err != nil {
 					return fmt.Errorf("failed to migrate ImagePulledRecord for image ref %q to the current version: %w", pullRecord.ImageRef, err)
 				}
+			} else {
+				rawHash := sha256.Sum256(fileContent)
+				rawLen := len(fileContent)
+				f.mu.Lock()
+				if f.pulledRecords != nil {
+					f.pulledRecords[filename] = cachedPulledRecordEntry{
+						rawHash: rawHash,
+						rawLen:  rawLen,
+						record:  pullRecord,
+					}
+				}
+				f.mu.Unlock()
 			}
 			return nil
 		})
@@ -125,12 +182,28 @@ func (f *fsPullRecordsAccessor) WriteImagePullIntent(logger klog.Logger, image s
 		Image: image,
 	}
 
-	intentBytes := bytes.NewBuffer([]byte{})
+	intentBytes := encodeBufferPool.Get().(*bytes.Buffer)
+	intentBytes.Reset()
+	defer func() {
+		intentBytes.Reset()
+		encodeBufferPool.Put(intentBytes)
+	}()
+
 	if err := f.encoder.Encode(&intent, intentBytes); err != nil {
 		return err
 	}
 
-	return writeFile(f.pullingDir, cacheFilename(image), intentBytes.Bytes())
+	filename := cacheFilename(image)
+	if err := writeFile(f.pullingDir, filename, intentBytes.Bytes()); err != nil {
+		return err
+	}
+
+	f.mu.Lock()
+	if f.pullingFiles != nil {
+		f.pullingFiles[filename] = struct{}{}
+	}
+	f.mu.Unlock()
+	return nil
 }
 
 func (f *fsPullRecordsAccessor) ListImagePullIntents() ([]*kubeletconfiginternal.ImagePullIntent, error) {
@@ -150,15 +223,21 @@ func (f *fsPullRecordsAccessor) ListImagePullIntents() ([]*kubeletconfiginternal
 }
 
 func (f *fsPullRecordsAccessor) ImagePullIntentExists(image string) (bool, error) {
-	intentRecordPath := filepath.Join(f.pullingDir, cacheFilename(image))
-	intentBytes, err := os.ReadFile(intentRecordPath)
-	if os.IsNotExist(err) {
+	intentRecordPath := f.pullingDir + string(filepath.Separator) + cacheFilename(image)
+	buf := encodeBufferPool.Get().(*bytes.Buffer)
+	buf.Reset()
+	defer func() {
+		buf.Reset()
+		encodeBufferPool.Put(buf)
+	}()
+
+	if err := readFileIntoBuffer(intentRecordPath, buf); os.IsNotExist(err) {
 		return false, nil
 	} else if err != nil {
 		return false, err
 	}
 
-	intent, _, err := decodeIntent(f.decoder, intentBytes)
+	intent, _, err := decodeIntent(f.decoder, buf.Bytes())
 	if err != nil {
 		return false, err
 	}
@@ -167,38 +246,113 @@ func (f *fsPullRecordsAccessor) ImagePullIntentExists(image string) (bool, error
 }
 
 func (f *fsPullRecordsAccessor) DeleteImagePullIntent(logger klog.Logger, image string) error {
-	err := os.Remove(filepath.Join(f.pullingDir, cacheFilename(image)))
-	if os.IsNotExist(err) {
+	filename := cacheFilename(image)
+	err := os.Remove(f.pullingDir + string(filepath.Separator) + filename)
+	if err == nil || os.IsNotExist(err) {
+		f.mu.Lock()
+		if f.pullingFiles != nil {
+			delete(f.pullingFiles, filename)
+		}
+		f.mu.Unlock()
 		return nil
 	}
 	return err
 }
 
 func (f *fsPullRecordsAccessor) GetImagePulledRecord(imageRef string) (*kubeletconfiginternal.ImagePulledRecord, bool, error) {
-	recordBytes, err := os.ReadFile(filepath.Join(f.pulledDir, cacheFilename(imageRef)))
-	if os.IsNotExist(err) {
+	filename := cacheFilename(imageRef)
+	recordPath := f.pulledDir + string(filepath.Separator) + filename
+	buf := encodeBufferPool.Get().(*bytes.Buffer)
+	buf.Reset()
+	defer func() {
+		buf.Reset()
+		encodeBufferPool.Put(buf)
+	}()
+
+	if err := readFileIntoBuffer(recordPath, buf); os.IsNotExist(err) {
 		return nil, false, nil
 	} else if err != nil {
 		return nil, false, err
 	}
 
-	pulledRecord, _, err := decodePulledRecord(f.decoder, recordBytes)
+	recordBytes := buf.Bytes()
+	rawLen := len(recordBytes)
+	rawHash := sha256.Sum256(recordBytes)
+
+	f.mu.Lock()
+	if f.pulledRecords != nil {
+		if entry, ok := f.pulledRecords[filename]; ok && entry.rawLen == rawLen && entry.rawHash == rawHash && entry.record != nil {
+			rec := entry.record
+			f.mu.Unlock()
+			if rec.ImageRef != imageRef {
+				return nil, false, nil
+			}
+			return rec, true, nil
+		}
+	}
+	f.mu.Unlock()
+
+	pulledRecord, isCurrentVersion, err := decodePulledRecord(f.decoder, recordBytes)
 	if err != nil {
 		return nil, true, err
 	}
 	if pulledRecord.ImageRef != imageRef {
 		return nil, false, nil
 	}
-	return pulledRecord, true, err
+	if isCurrentVersion {
+		f.mu.Lock()
+		if f.pulledRecords != nil {
+			f.pulledRecords[filename] = cachedPulledRecordEntry{
+				rawHash: rawHash,
+				rawLen:  rawLen,
+				record:  pulledRecord,
+			}
+		}
+		f.mu.Unlock()
+	}
+	return pulledRecord, true, nil
 }
 
 func (f *fsPullRecordsAccessor) ListImagePulledRecords() ([]*kubeletconfiginternal.ImagePulledRecord, error) {
+	f.mu.Lock()
+	estCap := len(f.pulledFiles)
+	f.mu.Unlock()
+
 	var pullRecords []*kubeletconfiginternal.ImagePulledRecord
+	if estCap > 0 {
+		pullRecords = make([]*kubeletconfiginternal.ImagePulledRecord, 0, estCap)
+	}
+
 	err := processDirFiles(f.pulledDir,
 		func(filePath string, fileContent []byte) error {
-			pullRecord, _, err := decodePulledRecord(f.decoder, fileContent)
+			filename := filepath.Base(filePath)
+			rawLen := len(fileContent)
+			rawHash := sha256.Sum256(fileContent)
+
+			f.mu.Lock()
+			if f.pulledRecords != nil {
+				if entry, ok := f.pulledRecords[filename]; ok && entry.rawLen == rawLen && entry.rawHash == rawHash && entry.record != nil {
+					pullRecords = append(pullRecords, entry.record)
+					f.mu.Unlock()
+					return nil
+				}
+			}
+			f.mu.Unlock()
+
+			pullRecord, isCurrentVersion, err := decodePulledRecord(f.decoder, fileContent)
 			if err != nil {
 				return fmt.Errorf("failed to deserialize content of file %q into ImagePulledRecord: %w", filePath, err)
+			}
+			if isCurrentVersion {
+				f.mu.Lock()
+				if f.pulledRecords != nil {
+					f.pulledRecords[filename] = cachedPulledRecordEntry{
+						rawHash: rawHash,
+						rawLen:  rawLen,
+						record:  pullRecord,
+					}
+				}
+				f.mu.Unlock()
 			}
 			pullRecords = append(pullRecords, pullRecord)
 			return nil
@@ -208,23 +362,66 @@ func (f *fsPullRecordsAccessor) ListImagePulledRecords() ([]*kubeletconfigintern
 }
 
 func (f *fsPullRecordsAccessor) WriteImagePulledRecord(logger klog.Logger, pulledRecord *kubeletconfiginternal.ImagePulledRecord) error {
-	recordBytes := bytes.NewBuffer([]byte{})
+	recordBytes := encodeBufferPool.Get().(*bytes.Buffer)
+	recordBytes.Reset()
+	defer func() {
+		recordBytes.Reset()
+		encodeBufferPool.Put(recordBytes)
+	}()
+
 	if err := f.encoder.Encode(pulledRecord, recordBytes); err != nil {
 		return fmt.Errorf("failed to serialize ImagePulledRecord: %w", err)
 	}
 
-	return writeFile(f.pulledDir, cacheFilename(pulledRecord.ImageRef), recordBytes.Bytes())
+	filename := cacheFilename(pulledRecord.ImageRef)
+	rawBytes := recordBytes.Bytes()
+	if err := writeFile(f.pulledDir, filename, rawBytes); err != nil {
+		return err
+	}
+
+	rawHash := sha256.Sum256(rawBytes)
+	rawLen := len(rawBytes)
+	f.mu.Lock()
+	if f.pulledFiles != nil {
+		f.pulledFiles[filename] = struct{}{}
+	}
+	if f.pulledRecords != nil {
+		f.pulledRecords[filename] = cachedPulledRecordEntry{
+			rawHash: rawHash,
+			rawLen:  rawLen,
+			record:  pulledRecord,
+		}
+	}
+	f.mu.Unlock()
+	return nil
 }
 
 func (f *fsPullRecordsAccessor) DeleteImagePulledRecord(logger klog.Logger, imageRef string) error {
-	err := os.Remove(filepath.Join(f.pulledDir, cacheFilename(imageRef)))
-	if os.IsNotExist(err) {
+	filename := cacheFilename(imageRef)
+	err := os.Remove(f.pulledDir + string(filepath.Separator) + filename)
+	if err == nil || os.IsNotExist(err) {
+		f.mu.Lock()
+		if f.pulledFiles != nil {
+			delete(f.pulledFiles, filename)
+		}
+		if f.pulledRecords != nil {
+			delete(f.pulledRecords, filename)
+		}
+		f.mu.Unlock()
 		return nil
 	}
 	return err
 }
 
 func (f *fsPullRecordsAccessor) intentsSize() (uint, error) {
+	f.mu.Lock()
+	if f.countsInitialized {
+		count := uint(len(f.pullingFiles))
+		f.mu.Unlock()
+		return count, nil
+	}
+	f.mu.Unlock()
+
 	intentsCount, err := countCacheFiles(f.pullingDir)
 	if err != nil {
 		return 0, err
@@ -233,6 +430,14 @@ func (f *fsPullRecordsAccessor) intentsSize() (uint, error) {
 }
 
 func (f *fsPullRecordsAccessor) pulledRecordsSize() (uint, error) {
+	f.mu.Lock()
+	if f.countsInitialized {
+		count := uint(len(f.pulledFiles))
+		f.mu.Unlock()
+		return count, nil
+	}
+	f.mu.Unlock()
+
 	pulledRecordsCount, err := countCacheFiles(f.pulledDir)
 	if err != nil {
 		return 0, err
@@ -270,7 +475,11 @@ func countCacheFiles(dirName string) (uint, error) {
 }
 
 func cacheFilename(image string) string {
-	return fmt.Sprintf("%s%x", cacheFilesSHA256Prefix, sha256.Sum256([]byte(image)))
+	sum := sha256.Sum256([]byte(image))
+	var buf [len(cacheFilesSHA256Prefix) + sha256.Size*2]byte
+	copy(buf[:], cacheFilesSHA256Prefix)
+	hex.Encode(buf[len(cacheFilesSHA256Prefix):], sum[:])
+	return string(buf[:])
 }
 
 // isValidCacheFile returns true if the info doesn't point to a directory and
@@ -288,16 +497,20 @@ func isValidCacheFile(fileInfo os.DirEntry) bool {
 // It assures write atomicity by creating a temporary file first and only after
 // a successful write, it move the temp file in place of the target.
 func writeFile(dir, filename string, content []byte) error {
-	// create target folder if it does not exists yet
-	if err := os.MkdirAll(dir, 0700); err != nil {
-		return fmt.Errorf("failed to create directory %q: %w", dir, err)
-	}
-
-	targetPath := filepath.Join(dir, filename)
-	tmpPath := targetPath + tmpFilesSuffix
+	tmpPath := dir + string(filepath.Separator) + filename + tmpFilesSuffix
+	targetPath := tmpPath[:len(tmpPath)-len(tmpFilesSuffix)]
 	if err := os.WriteFile(tmpPath, content, 0600); err != nil {
-		_ = os.Remove(tmpPath) // attempt a delete in case the file was at least partially written
-		return fmt.Errorf("failed to create temporary file %q: %w", tmpPath, err)
+		if errors.Is(err, fs.ErrNotExist) {
+			// create target folder if it does not exist yet
+			if mkdirErr := os.MkdirAll(dir, 0700); mkdirErr != nil {
+				return fmt.Errorf("failed to create directory %q: %w", dir, mkdirErr)
+			}
+			err = os.WriteFile(tmpPath, content, 0600)
+		}
+		if err != nil {
+			_ = os.Remove(tmpPath) // attempt a delete in case the file was at least partially written
+			return fmt.Errorf("failed to create temporary file %q: %w", tmpPath, err)
+		}
 	}
 
 	if err := os.Rename(tmpPath, targetPath); err != nil {
@@ -307,8 +520,28 @@ func writeFile(dir, filename string, content []byte) error {
 	return nil
 }
 
+func readFileIntoBuffer(path string, buf *bytes.Buffer) error {
+	f, err := os.Open(path)
+	if err != nil {
+		return err
+	}
+	_, readErr := buf.ReadFrom(f)
+	closeErr := f.Close()
+	if readErr != nil {
+		return readErr
+	}
+	return closeErr
+}
+
 // processDirFiles reads files in a given directory and peforms `fileAction` action on those.
 func processDirFiles(dirName string, fileAction func(filePath string, fileContent []byte) error) error {
+	buf := encodeBufferPool.Get().(*bytes.Buffer)
+	buf.Reset()
+	defer func() {
+		buf.Reset()
+		encodeBufferPool.Put(buf)
+	}()
+
 	var walkErrors []error
 	err := filepath.WalkDir(dirName, func(path string, d fs.DirEntry, err error) error {
 		if err != nil {
@@ -329,13 +562,13 @@ func processDirFiles(dirName string, fileAction func(filePath string, fileConten
 			return nil
 		}
 
-		fileContent, err := os.ReadFile(path)
-		if err != nil {
+		buf.Reset()
+		if err := readFileIntoBuffer(path, buf); err != nil {
 			walkErrors = append(walkErrors, fmt.Errorf("failed to read %q: %w", path, err))
 			return nil
 		}
 
-		if err := fileAction(path, fileContent); err != nil {
+		if err := fileAction(path, buf.Bytes()); err != nil {
 			walkErrors = append(walkErrors, err)
 			return nil
 		}

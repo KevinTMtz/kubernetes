@@ -404,13 +404,27 @@ func Images(nodeStatusMaxImages int32,
 			containerImages = containerImages[0:nodeStatusMaxImages]
 		}
 
+		if len(containerImages) > 0 {
+			imagesOnNode = make([]v1.ContainerImage, 0, len(containerImages))
+		}
 		for _, image := range containerImages {
 			// make a copy to avoid modifying slice members of the image items in the list
-			names := append([]string{}, image.RepoDigests...)
-			names = append(names, image.RepoTags...)
-			// Report up to MaxNamesPerImageInNodeStatus names per image.
-			if len(names) > MaxNamesPerImageInNodeStatus {
-				names = names[0:MaxNamesPerImageInNodeStatus]
+			numNames := len(image.RepoDigests) + len(image.RepoTags)
+			if numNames > MaxNamesPerImageInNodeStatus {
+				numNames = MaxNamesPerImageInNodeStatus
+			}
+			names := make([]string, 0, numNames)
+			for _, d := range image.RepoDigests {
+				if len(names) >= MaxNamesPerImageInNodeStatus {
+					break
+				}
+				names = append(names, d)
+			}
+			for _, t := range image.RepoTags {
+				if len(names) >= MaxNamesPerImageInNodeStatus {
+					break
+				}
+				names = append(names, t)
 			}
 			imagesOnNode = append(imagesOnNode, v1.ContainerImage{
 				Names:     names,
