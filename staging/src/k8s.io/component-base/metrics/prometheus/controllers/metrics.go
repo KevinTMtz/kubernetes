@@ -59,10 +59,10 @@ func Register() {
 // These values use set instead of inc/dec to avoid accidentally double counting
 // a controller that starts but fails to properly signal when it crashes.
 func (a *ControllerManagerMetrics) ControllerStarted(name string) {
-	controllerInstanceCount.With(k8smetrics.Labels{"name": name, "manager": a.manager}).Set(float64(1))
+	controllerInstanceCount.WithLabelValues(name, a.manager).Set(float64(1))
 }
 
 // ControllerStopped sets the controllerInstanceCount to 0.
 func (a *ControllerManagerMetrics) ControllerStopped(name string) {
-	controllerInstanceCount.With(k8smetrics.Labels{"name": name, "manager": a.manager}).Set(float64(0))
+	controllerInstanceCount.WithLabelValues(name, a.manager).Set(float64(0))
 }

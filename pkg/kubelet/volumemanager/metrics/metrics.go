@@ -85,10 +85,10 @@ type volumeCount map[string]map[string]int64
 func (v volumeCount) add(state, plugin string) {
 	count, ok := v[state]
 	if !ok {
-		count = map[string]int64{}
+		count = make(map[string]int64, 8)
+		v[state] = count
 	}
 	count[plugin]++
-	v[state] = count
 }
 
 // Register registers Volume Manager metrics.
@@ -119,19 +119,21 @@ func (c *totalVolumesCollector) DescribeWithStability(ch chan<- *metrics.Desc) {
 
 // CollectWithStability implements the metrics.StableCollector interface.
 func (c *totalVolumesCollector) CollectWithStability(ch chan<- metrics.Metric) {
+	labels := make([]string, 2)
 	for stateName, pluginCount := range c.getVolumeCount() {
+		labels[1] = stateName
 		for pluginName, count := range pluginCount {
+			labels[0] = pluginName
 			ch <- metrics.NewLazyConstMetric(totalVolumesDesc,
 				metrics.GaugeValue,
 				float64(count),
-				pluginName,
-				stateName)
+				labels...)
 		}
 	}
 }
 
 func (c *totalVolumesCollector) getVolumeCount() volumeCount {
-	counter := make(volumeCount)
+	counter := make(volumeCount, 2)
 	for _, mountedVolume := range c.asw.GetMountedVolumes() {
 		pluginName := volumeutil.GetFullQualifiedPluginNameForVolume(mountedVolume.PluginName, mountedVolume.VolumeSpec)
 		if pluginName == "" {

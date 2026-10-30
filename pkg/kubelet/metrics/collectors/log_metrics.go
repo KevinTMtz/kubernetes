@@ -73,17 +73,21 @@ func (c *logMetricsCollector) CollectWithStability(ch chan<- metrics.Metric) {
 		return
 	}
 
-	for _, ps := range podStats {
-		for _, c := range ps.Containers {
+	labels := make([]string, 4)
+	for i := range podStats {
+		ps := &podStats[i]
+		labels[0] = ps.PodRef.UID
+		labels[1] = ps.PodRef.Namespace
+		labels[2] = ps.PodRef.Name
+		for j := range ps.Containers {
+			c := &ps.Containers[j]
 			if c.Logs != nil && c.Logs.UsedBytes != nil {
+				labels[3] = c.Name
 				ch <- metrics.NewLazyConstMetric(
 					descLogSize,
 					metrics.GaugeValue,
 					float64(*c.Logs.UsedBytes),
-					ps.PodRef.UID,
-					ps.PodRef.Namespace,
-					ps.PodRef.Name,
-					c.Name,
+					labels...,
 				)
 			}
 		}

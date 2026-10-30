@@ -166,18 +166,6 @@ var (
 		})
 )
 
-// volumeCount counts by PluginName and VolumeMode.
-type volumeCount map[string]map[string]int
-
-func (v volumeCount) add(pluginName string, volumeMode string) {
-	count, ok := v[pluginName]
-	if !ok {
-		count = map[string]int{}
-	}
-	count[volumeMode]++
-	v[pluginName] = count
-}
-
 func (collector *pvAndPVCCountCollector) DescribeWithStability(ch chan<- *metrics.Desc) {
 	ch <- totalPVCountDesc
 	ch <- boundPVCountDesc
@@ -191,77 +179,105 @@ func (collector *pvAndPVCCountCollector) CollectWithStability(ch chan<- metrics.
 	collector.pvcCollect(ch)
 }
 
+var pvSpecPool = sync.Pool{
+	New: func() any {
+		return &volume.Spec{}
+	},
+}
+
+type pvPluginModeKey struct {
+	pluginName string
+	volumeMode string
+}
+
 func (collector *pvAndPVCCountCollector) getPVPluginName(pv *v1.PersistentVolume) string {
-	spec := volume.NewSpecFromPersistentVolume(pv, true)
+	if pv == nil {
+		return pluginNameNotAvailable
+	}
+	spec := pvSpecPool.Get().(*volume.Spec)
+	*spec = volume.Spec{PersistentVolume: pv, ReadOnly: true}
 	fullPluginName := pluginNameNotAvailable
 	if plugin, err := collector.pluginMgr.FindPluginBySpec(spec); err == nil {
 		fullPluginName = metricutil.GetFullQualifiedPluginNameForVolume(plugin.GetPluginName(), spec)
 	}
+	*spec = volume.Spec{}
+	pvSpecPool.Put(spec)
 	return fullPluginName
 }
 
 func (collector *pvAndPVCCountCollector) pvCollect(ch chan<- metrics.Metric) {
-	boundNumberByStorageClass := make(map[string]int)
-	unboundNumberByStorageClass := make(map[string]int)
-	totalCount := make(volumeCount)
+	boundNumberByStorageClass := make(map[string]int, 8)
+	unboundNumberByStorageClass := make(map[string]int, 8)
+	totalCount := make(map[pvPluginModeKey]int, 16)
 	for _, pv := range collector.pvLister.List() {
 		pluginName := collector.getPVPluginName(pv)
-		totalCount.add(pluginName, string(*pv.Spec.VolumeMode))
+		totalCount[pvPluginModeKey{pluginName: pluginName, volumeMode: string(*pv.Spec.VolumeMode)}]++
 		if pv.Status.Phase == v1.VolumeBound {
 			boundNumberByStorageClass[pv.Spec.StorageClassName]++
 		} else {
 			unboundNumberByStorageClass[pv.Spec.StorageClassName]++
 		}
 	}
+	label1 := make([]string, 1)
 	for storageClassName, number := range boundNumberByStorageClass {
+		label1[0] = storageClassName
 		ch <- metrics.NewLazyConstMetric(
 			boundPVCountDesc,
 			metrics.GaugeValue,
 			float64(number),
-			storageClassName)
+			label1...)
 	}
 	for storageClassName, number := range unboundNumberByStorageClass {
+		label1[0] = storageClassName
 		ch <- metrics.NewLazyConstMetric(
 			unboundPVCountDesc,
 			metrics.GaugeValue,
 			float64(number),
-			storageClassName)
+			label1...)
 	}
-	for pluginName, volumeModeCount := range totalCount {
-		for volumeMode, number := range volumeModeCount {
-			ch <- metrics.NewLazyConstMetric(
-				totalPVCountDesc,
-				metrics.GaugeValue,
-				float64(number),
-				pluginName,
-				volumeMode)
-		}
+	label2 := make([]string, 2)
+	for key, number := range totalCount {
+		label2[0] = key.pluginName
+		label2[1] = key.volumeMode
+		ch <- metrics.NewLazyConstMetric(
+			totalPVCountDesc,
+			metrics.GaugeValue,
+			float64(number),
+			label2...)
 	}
 }
 
 func (collector *pvAndPVCCountCollector) pvcCollect(ch chan<- metrics.Metric) {
-	boundNumber := make(map[pvcBindingMetricDimensions]int)
-	unboundNumber := make(map[pvcBindingMetricDimensions]int)
+	boundNumber := make(map[pvcBindingMetricDimensions]int, 16)
+	unboundNumber := make(map[pvcBindingMetricDimensions]int, 16)
 	for _, pvc := range collector.pvcLister.List() {
+		dims := getPVCMetricDimensions(pvc)
 		if pvc.Status.Phase == v1.ClaimBound {
-			boundNumber[getPVCMetricDimensions(pvc)]++
+			boundNumber[dims]++
 		} else {
-			unboundNumber[getPVCMetricDimensions(pvc)]++
+			unboundNumber[dims]++
 		}
 	}
+	label3 := make([]string, 3)
 	for pvcLabels, number := range boundNumber {
+		label3[0] = pvcLabels.namespace
+		label3[1] = pvcLabels.storageClassName
+		label3[2] = pvcLabels.volumeAttributesClassName
 		ch <- metrics.NewLazyConstMetric(
 			boundPVCCountDesc,
 			metrics.GaugeValue,
 			float64(number),
-			pvcLabels.namespace, pvcLabels.storageClassName, pvcLabels.volumeAttributesClassName)
+			label3...)
 	}
 	for pvcLabels, number := range unboundNumber {
+		label3[0] = pvcLabels.namespace
+		label3[1] = pvcLabels.storageClassName
+		label3[2] = pvcLabels.volumeAttributesClassName
 		ch <- metrics.NewLazyConstMetric(
 			unboundPVCCountDesc,
 			metrics.GaugeValue,
 			float64(number),
-			pvcLabels.namespace, pvcLabels.storageClassName, pvcLabels.volumeAttributesClassName)
+			label3...)
 	}
 }
 

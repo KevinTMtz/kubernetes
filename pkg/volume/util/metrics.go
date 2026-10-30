@@ -17,7 +17,6 @@ limitations under the License.
 package util
 
 import (
-	"fmt"
 	"strconv"
 	"sync"
 	"time"
@@ -119,6 +118,34 @@ func FSGroupCompleteHook(plugin volume.VolumePlugin, spec *volume.Spec) func(typ
 	return OperationCompleteHook(GetFullQualifiedPluginNameForVolume(plugin.GetPluginName(), spec), "volume_apply_access_control")
 }
 
+type fqPluginKey struct {
+	pluginName string
+	driverName string
+}
+
+var (
+	fqPluginNameCacheMu sync.RWMutex
+	fqPluginNameCache   = make(map[fqPluginKey]string, 32)
+)
+
+func getCachedFQPluginName(pluginName, driverName string) string {
+	key := fqPluginKey{pluginName: pluginName, driverName: driverName}
+	fqPluginNameCacheMu.RLock()
+	cached, ok := fqPluginNameCache[key]
+	fqPluginNameCacheMu.RUnlock()
+	if ok {
+		return cached
+	}
+	full := pluginName + ":" + driverName
+	fqPluginNameCacheMu.Lock()
+	if len(fqPluginNameCache) >= 256 {
+		clear(fqPluginNameCache)
+	}
+	fqPluginNameCache[key] = full
+	fqPluginNameCacheMu.Unlock()
+	return full
+}
+
 // GetFullQualifiedPluginNameForVolume returns full qualified plugin name for
 // given volume. For CSI plugin, it appends plugin driver name at the end of
 // plugin name, e.g. kubernetes.io/csi:csi-hostpath. It helps to distinguish
@@ -127,10 +154,10 @@ func FSGroupCompleteHook(plugin volume.VolumePlugin, spec *volume.Spec) func(typ
 func GetFullQualifiedPluginNameForVolume(pluginName string, spec *volume.Spec) string {
 	if spec != nil {
 		if spec.Volume != nil && spec.Volume.CSI != nil {
-			return fmt.Sprintf("%s:%s", pluginName, spec.Volume.CSI.Driver)
+			return getCachedFQPluginName(pluginName, spec.Volume.CSI.Driver)
 		}
 		if spec.PersistentVolume != nil && spec.PersistentVolume.Spec.CSI != nil {
-			return fmt.Sprintf("%s:%s", pluginName, spec.PersistentVolume.Spec.CSI.Driver)
+			return getCachedFQPluginName(pluginName, spec.PersistentVolume.Spec.CSI.Driver)
 		}
 	}
 	return pluginName

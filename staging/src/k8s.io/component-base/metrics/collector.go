@@ -18,9 +18,23 @@ package metrics
 
 import (
 	"fmt"
+	"sync"
 
 	"github.com/blang/semver/v4"
 	"github.com/prometheus/client_golang/prometheus"
+)
+
+type eofMetricType struct {
+	Metric
+}
+
+var (
+	eofMetric      Metric = &eofMetricType{}
+	metricChanPool        = sync.Pool{
+		New: func() any {
+			return make(chan Metric, 64)
+		},
+	}
 )
 
 // StableCollector extends the prometheus.Collector interface to allow customization of the
@@ -77,14 +91,18 @@ func (bsc *BaseStableCollector) CollectWithStability(ch chan<- Metric) {
 
 // Collect is called by the Prometheus registry when collecting metrics.
 func (bsc *BaseStableCollector) Collect(ch chan<- prometheus.Metric) {
-	mch := make(chan Metric)
+	mch := metricChanPool.Get().(chan Metric)
 
 	go func() {
 		bsc.self.CollectWithStability(mch)
-		close(mch)
+		mch <- eofMetric
 	}()
 
-	for m := range mch {
+	for {
+		m := <-mch
+		if m == eofMetric {
+			break
+		}
 		// nil Metric usually means hidden metrics
 		if m == nil {
 			continue
@@ -92,6 +110,8 @@ func (bsc *BaseStableCollector) Collect(ch chan<- prometheus.Metric) {
 
 		ch <- prometheus.Metric(m)
 	}
+
+	metricChanPool.Put(mch)
 }
 
 func (bsc *BaseStableCollector) add(d *Desc) {

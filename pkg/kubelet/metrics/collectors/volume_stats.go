@@ -98,16 +98,18 @@ func (collector *volumeStatsCollector) CollectWithStability(ch chan<- metrics.Me
 	if err != nil {
 		return
 	}
-	addGauge := func(desc *metrics.Desc, pvcRef *stats.PVCReference, v float64, lv ...string) {
-		lv = append([]string{pvcRef.Namespace, pvcRef.Name}, lv...)
-		ch <- metrics.NewLazyConstMetric(desc, metrics.GaugeValue, v, lv...)
+	pvcLabels := make([]string, 2)
+	addGauge := func(desc *metrics.Desc, v float64) {
+		ch <- metrics.NewLazyConstMetric(desc, metrics.GaugeValue, v, pvcLabels...)
 	}
-	allPVCs := sets.Set[stats.PVCReference]{}
-	for _, podStat := range podStats {
+	allPVCs := make(sets.Set[stats.PVCReference], len(podStats)*2)
+	for i := range podStats {
+		podStat := &podStats[i]
 		if podStat.VolumeStats == nil {
 			continue
 		}
-		for _, volumeStat := range podStat.VolumeStats {
+		for j := range podStat.VolumeStats {
+			volumeStat := &podStat.VolumeStats[j]
 			pvcRef := volumeStat.PVCRef
 			if pvcRef == nil {
 				// ignore if no PVC reference
@@ -117,12 +119,14 @@ func (collector *volumeStatsCollector) CollectWithStability(ch chan<- metrics.Me
 				// ignore if already collected
 				continue
 			}
-			addGauge(volumeStatsCapacityBytesDesc, pvcRef, float64(*volumeStat.CapacityBytes))
-			addGauge(volumeStatsAvailableBytesDesc, pvcRef, float64(*volumeStat.AvailableBytes))
-			addGauge(volumeStatsUsedBytesDesc, pvcRef, float64(*volumeStat.UsedBytes))
-			addGauge(volumeStatsInodesDesc, pvcRef, float64(*volumeStat.Inodes))
-			addGauge(volumeStatsInodesFreeDesc, pvcRef, float64(*volumeStat.InodesFree))
-			addGauge(volumeStatsInodesUsedDesc, pvcRef, float64(*volumeStat.InodesUsed))
+			pvcLabels[0] = pvcRef.Namespace
+			pvcLabels[1] = pvcRef.Name
+			addGauge(volumeStatsCapacityBytesDesc, float64(*volumeStat.CapacityBytes))
+			addGauge(volumeStatsAvailableBytesDesc, float64(*volumeStat.AvailableBytes))
+			addGauge(volumeStatsUsedBytesDesc, float64(*volumeStat.UsedBytes))
+			addGauge(volumeStatsInodesDesc, float64(*volumeStat.Inodes))
+			addGauge(volumeStatsInodesFreeDesc, float64(*volumeStat.InodesFree))
+			addGauge(volumeStatsInodesUsedDesc, float64(*volumeStat.InodesUsed))
 			allPVCs.Insert(*pvcRef)
 		}
 	}

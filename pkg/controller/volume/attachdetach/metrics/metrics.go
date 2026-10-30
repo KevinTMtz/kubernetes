@@ -20,6 +20,7 @@ import (
 	"errors"
 	"sync"
 
+	v1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/types"
 	corelisters "k8s.io/client-go/listers/core/v1"
@@ -114,10 +115,16 @@ type volumeCount map[string]map[string]int64
 func (v volumeCount) add(typeKey, counterKey string) {
 	count, ok := v[typeKey]
 	if !ok {
-		count = map[string]int64{}
+		count = make(map[string]int64, 4)
+		v[typeKey] = count
 	}
 	count[counterKey]++
-	v[typeKey] = count
+}
+
+var adSpecPool = sync.Pool{
+	New: func() any {
+		return &volume.Spec{}
+	},
 }
 
 func newAttachDetachStateCollector(
@@ -141,27 +148,96 @@ func (collector *attachDetachStateCollector) DescribeWithStability(ch chan<- *me
 }
 
 func (collector *attachDetachStateCollector) CollectWithStability(ch chan<- metrics.Metric) {
+	labelBuf := make([]string, 2)
 	nodeVolumeMap := collector.getVolumeInUseCount(klog.TODO())
 	for nodeName, pluginCount := range nodeVolumeMap {
+		labelBuf[0] = string(nodeName)
 		for pluginName, count := range pluginCount {
+			labelBuf[1] = pluginName
 			ch <- metrics.NewLazyConstMetric(inUseVolumeMetricDesc,
 				metrics.GaugeValue,
 				float64(count),
-				string(nodeName),
-				pluginName)
+				labelBuf...)
 		}
 	}
 
 	stateVolumeMap := collector.getTotalVolumesCount()
 	for stateName, pluginCount := range stateVolumeMap {
+		labelBuf[1] = string(stateName)
 		for pluginName, count := range pluginCount {
+			labelBuf[0] = pluginName
 			ch <- metrics.NewLazyConstMetric(totalVolumesMetricDesc,
 				metrics.GaugeValue,
 				float64(count),
-				pluginName,
-				string(stateName))
+				labelBuf...)
 		}
 	}
+}
+
+func (collector *attachDetachStateCollector) resolveFallbackPluginName(logger klog.Logger, podVolume *v1.Volume, pod *v1.Pod) (string, bool) {
+	volumeSpec, err := util.CreateVolumeSpecWithNodeMigration(logger, *podVolume, pod, types.NodeName(pod.Spec.NodeName), collector.volumePluginMgr, collector.pvcLister, collector.pvLister, collector.csiMigratedPluginManager, collector.intreeToCSITranslator)
+	if err != nil {
+		return "", false
+	}
+	volumePlugin, err := collector.volumePluginMgr.FindPluginBySpec(volumeSpec)
+	if err != nil || volumePlugin == nil {
+		return "", false
+	}
+	return volumeutil.GetFullQualifiedPluginNameForVolume(volumePlugin.GetPluginName(), volumeSpec), true
+}
+
+func (collector *attachDetachStateCollector) resolveSpecPluginName(logger klog.Logger, spec *volume.Spec, podVolume *v1.Volume, pod *v1.Pod) (string, bool) {
+	if collector.csiMigratedPluginManager.PluginNameMapper != nil {
+		migratable, err := collector.csiMigratedPluginManager.IsMigratable(spec)
+		if err != nil {
+			return "", false
+		}
+		if migratable {
+			return collector.resolveFallbackPluginName(logger, podVolume, pod)
+		}
+	}
+	volumePlugin, err := collector.volumePluginMgr.FindPluginBySpec(spec)
+	if err != nil || volumePlugin == nil {
+		return "", false
+	}
+	return volumeutil.GetFullQualifiedPluginNameForVolume(volumePlugin.GetPluginName(), spec), true
+}
+
+func (collector *attachDetachStateCollector) resolvePodVolumePluginName(logger klog.Logger, podVolume *v1.Volume, pod *v1.Pod) (string, bool) {
+	if collector.volumePluginMgr == nil {
+		return "", false
+	}
+	if podVolume.Ephemeral != nil {
+		return collector.resolveFallbackPluginName(logger, podVolume, pod)
+	}
+
+	if pvcSource := podVolume.PersistentVolumeClaim; pvcSource != nil && pvcSource.ClaimName != "" {
+		if collector.pvcLister == nil || collector.pvLister == nil {
+			return "", false
+		}
+		claim, err := collector.pvcLister.PersistentVolumeClaims(pod.Namespace).Get(pvcSource.ClaimName)
+		if err != nil || claim == nil || claim.Status.Phase != v1.ClaimBound || claim.Spec.VolumeName == "" {
+			return "", false
+		}
+		pv, err := collector.pvLister.Get(claim.Spec.VolumeName)
+		if err != nil || pv == nil || pv.Spec.ClaimRef == nil || pv.Spec.ClaimRef.UID != claim.UID {
+			return "", false
+		}
+
+		spec := adSpecPool.Get().(*volume.Spec)
+		*spec = volume.Spec{PersistentVolume: pv, ReadOnly: pvcSource.ReadOnly}
+		pluginName, ok := collector.resolveSpecPluginName(logger, spec, podVolume, pod)
+		*spec = volume.Spec{}
+		adSpecPool.Put(spec)
+		return pluginName, ok
+	}
+
+	spec := adSpecPool.Get().(*volume.Spec)
+	*spec = volume.Spec{Volume: podVolume}
+	pluginName, ok := collector.resolveSpecPluginName(logger, spec, podVolume, pod)
+	*spec = volume.Spec{}
+	adSpecPool.Put(spec)
+	return pluginName, ok
 }
 
 func (collector *attachDetachStateCollector) getVolumeInUseCount(logger klog.Logger) volumeCount {
@@ -171,7 +247,7 @@ func (collector *attachDetachStateCollector) getVolumeInUseCount(logger klog.Log
 		return nil
 	}
 
-	nodeVolumeMap := make(volumeCount)
+	nodeVolumeMap := make(volumeCount, 64)
 	for _, pod := range pods {
 		if len(pod.Spec.Volumes) <= 0 {
 			continue
@@ -180,16 +256,11 @@ func (collector *attachDetachStateCollector) getVolumeInUseCount(logger klog.Log
 		if pod.Spec.NodeName == "" {
 			continue
 		}
-		for _, podVolume := range pod.Spec.Volumes {
-			volumeSpec, err := util.CreateVolumeSpecWithNodeMigration(logger, podVolume, pod, types.NodeName(pod.Spec.NodeName), collector.volumePluginMgr, collector.pvcLister, collector.pvLister, collector.csiMigratedPluginManager, collector.intreeToCSITranslator)
-			if err != nil {
+		for i := range pod.Spec.Volumes {
+			pluginName, ok := collector.resolvePodVolumePluginName(logger, &pod.Spec.Volumes[i], pod)
+			if !ok {
 				continue
 			}
-			volumePlugin, err := collector.volumePluginMgr.FindPluginBySpec(volumeSpec)
-			if err != nil {
-				continue
-			}
-			pluginName := volumeutil.GetFullQualifiedPluginNameForVolume(volumePlugin.GetPluginName(), volumeSpec)
 			nodeVolumeMap.add(pod.Spec.NodeName, pluginName)
 		}
 	}
@@ -197,7 +268,7 @@ func (collector *attachDetachStateCollector) getVolumeInUseCount(logger klog.Log
 }
 
 func (collector *attachDetachStateCollector) getTotalVolumesCount() volumeCount {
-	stateVolumeMap := make(volumeCount)
+	stateVolumeMap := make(volumeCount, 2)
 	for _, v := range collector.dsw.GetVolumesToAttach() {
 		if plugin, err := collector.volumePluginMgr.FindPluginBySpec(v.VolumeSpec); err == nil {
 			pluginName := pluginNameNotAvailable

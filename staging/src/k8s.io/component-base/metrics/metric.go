@@ -78,8 +78,9 @@ type lazyMetric struct {
 
 func (r *lazyMetric) IsCreated() bool {
 	r.createLock.RLock()
-	defer r.createLock.RUnlock()
-	return r.isCreated
+	created := r.isCreated
+	r.createLock.RUnlock()
+	return created
 }
 
 // lazyInit provides the lazyMetric with a reference to the kubeCollector it is supposed
@@ -101,14 +102,18 @@ func (r *lazyMetric) lazyInit(self kubeCollector, fqName string) {
 // deprecation and will override show-hidden-metrics for the explicitly
 // disabled metric.
 func (r *lazyMetric) preprocessMetric(currentVersion semver.Version) {
+	r.preprocessMetricWithDeprecatedVersion(currentVersion, r.self.DeprecatedVersion())
+}
+
+func (r *lazyMetric) preprocessMetricWithDeprecatedVersion(currentVersion semver.Version, deprecatedVersion *semver.Version) {
 	disabledMetricsLock.RLock()
-	defer disabledMetricsLock.RUnlock()
+	_, disabled := disabledMetrics[r.fqName]
+	disabledMetricsLock.RUnlock()
 	// disabling metrics is higher in precedence than showing hidden metrics
-	if _, ok := disabledMetrics[r.fqName]; ok {
+	if disabled {
 		r.isHidden.Store(true)
 		return
 	}
-	deprecatedVersion := r.self.DeprecatedVersion()
 	if deprecatedVersion == nil {
 		return
 	}
@@ -141,8 +146,9 @@ func (r *lazyMetric) IsDeprecated() bool {
 // hidden. Furthermore, this function no-opts and returns true if metric is already
 // created.
 func (r *lazyMetric) Create(version *semver.Version) bool {
+	deprecatedV := r.self.DeprecatedVersion()
 	if version != nil {
-		r.preprocessMetric(*version)
+		r.preprocessMetricWithDeprecatedVersion(*version, deprecatedV)
 	}
 	// let's not create if this metric is slated to be hidden
 	if r.IsHidden() {
@@ -160,7 +166,6 @@ func (r *lazyMetric) Create(version *semver.Version) bool {
 		}
 	})
 	sl := r.stabilityLevel
-	deprecatedV := r.self.DeprecatedVersion()
 	dv := ""
 	if deprecatedV != nil {
 		dv = deprecatedV.String()

@@ -48,10 +48,10 @@ type pluginCount map[string]map[string]int64
 func (pc pluginCount) add(state, pluginName string) {
 	count, ok := pc[state]
 	if !ok {
-		count = map[string]int64{}
+		count = make(map[string]int64, 16)
+		pc[state] = count
 	}
 	count[pluginName]++
-	pc[state] = count
 }
 
 // Register registers Plugin Manager metrics.
@@ -77,19 +77,21 @@ func (c *totalPluginsCollector) DescribeWithStability(ch chan<- *metrics.Desc) {
 
 // CollectWithStability implements the metrics.StableCollector interface.
 func (c *totalPluginsCollector) CollectWithStability(ch chan<- metrics.Metric) {
+	labels := make([]string, 2)
 	for stateName, pluginCount := range c.getPluginCount() {
+		labels[1] = stateName
 		for socketPath, count := range pluginCount {
+			labels[0] = socketPath
 			ch <- metrics.NewLazyConstMetric(totalPluginsDesc,
 				metrics.GaugeValue,
 				float64(count),
-				socketPath,
-				stateName)
+				labels...)
 		}
 	}
 }
 
 func (c *totalPluginsCollector) getPluginCount() pluginCount {
-	counter := make(pluginCount)
+	counter := make(pluginCount, 2)
 	for _, registeredPlugin := range c.asw.GetRegisteredPlugins() {
 		socketPath := registeredPlugin.SocketPath
 		counter.add("actual_state_of_world", socketPath)

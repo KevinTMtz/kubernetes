@@ -18,13 +18,28 @@ package metrics
 
 import (
 	"fmt"
+	"slices"
 	"sync"
+	"unicode/utf8"
 
 	"github.com/blang/semver/v4"
 	"github.com/prometheus/client_golang/prometheus"
+	dto "github.com/prometheus/client_model/go"
 
 	"k8s.io/klog/v2"
 )
+
+const maxDescLabelCacheEntries = 4096
+
+type descLabelCache struct {
+	initErr   error
+	zeroPairs []*dto.LabelPair
+	mu        sync.RWMutex
+	cache1    map[string][]*dto.LabelPair
+	cache2    map[[2]string][]*dto.LabelPair
+	cache3    map[[3]string][]*dto.LabelPair
+	cache4    map[[4]string][]*dto.LabelPair
+}
 
 // Desc is a prometheus.Desc extension.
 //
@@ -43,6 +58,7 @@ type Desc struct {
 	// promDesc is the descriptor used by every Prometheus Metric.
 	promDesc      *prometheus.Desc
 	annotatedHelp string
+	labelCache    *descLabelCache
 
 	// stabilityLevel represents the API guarantees for a given defined metric.
 	stabilityLevel StabilityLevel
@@ -187,6 +203,7 @@ func (d *Desc) ClearState() {
 
 	d.annotatedHelp = d.help
 	d.promDesc = nil
+	d.labelCache = nil
 }
 
 func (d *Desc) markDeprecated() {
@@ -206,6 +223,122 @@ func (d *Desc) initialize() {
 
 	// this actually creates the underlying prometheus desc.
 	d.promDesc = prometheus.NewDesc(d.fqName, d.annotatedHelp, d.variableLabels, prometheus.Labels(d.constLabels))
+	d.initLabelCache()
+}
+
+func (d *Desc) initLabelCache() {
+	_, err := prometheus.NewConstMetric(d.promDesc, prometheus.GaugeValue, 0, make([]string, len(d.variableLabels))...)
+	if err != nil {
+		d.labelCache = &descLabelCache{initErr: err}
+		return
+	}
+	lc := &descLabelCache{}
+	if len(d.variableLabels) == 0 {
+		lc.zeroPairs = prometheus.MakeLabelPairs(d.promDesc, nil)
+	}
+	d.labelCache = lc
+}
+
+func (d *Desc) getOrBuildLabelPairs(labelValues []string) ([]*dto.LabelPair, bool) {
+	lc := d.labelCache
+	if lc == nil || lc.initErr != nil || len(labelValues) != len(d.variableLabels) {
+		return nil, false
+	}
+	switch len(d.variableLabels) {
+	case 0:
+		return lc.zeroPairs, true
+	case 1:
+		k := labelValues[0]
+		lc.mu.RLock()
+		pairs, ok := lc.cache1[k]
+		lc.mu.RUnlock()
+		if ok {
+			return pairs, true
+		}
+		if !utf8.ValidString(k) {
+			return nil, false
+		}
+		pairs = prometheus.MakeLabelPairs(d.promDesc, []string{k})
+		lc.mu.Lock()
+		if lc.cache1 == nil {
+			lc.cache1 = make(map[string][]*dto.LabelPair, 16)
+		} else if len(lc.cache1) >= maxDescLabelCacheEntries {
+			clear(lc.cache1)
+		}
+		lc.cache1[k] = pairs
+		lc.mu.Unlock()
+		return pairs, true
+	case 2:
+		k := [2]string{labelValues[0], labelValues[1]}
+		lc.mu.RLock()
+		pairs, ok := lc.cache2[k]
+		lc.mu.RUnlock()
+		if ok {
+			return pairs, true
+		}
+		if !utf8.ValidString(k[0]) || !utf8.ValidString(k[1]) {
+			return nil, false
+		}
+		pairs = prometheus.MakeLabelPairs(d.promDesc, []string{k[0], k[1]})
+		lc.mu.Lock()
+		if lc.cache2 == nil {
+			lc.cache2 = make(map[[2]string][]*dto.LabelPair, 64)
+		} else if len(lc.cache2) >= maxDescLabelCacheEntries {
+			clear(lc.cache2)
+		}
+		lc.cache2[k] = pairs
+		lc.mu.Unlock()
+		return pairs, true
+	case 3:
+		k := [3]string{labelValues[0], labelValues[1], labelValues[2]}
+		lc.mu.RLock()
+		pairs, ok := lc.cache3[k]
+		lc.mu.RUnlock()
+		if ok {
+			return pairs, true
+		}
+		if !utf8.ValidString(k[0]) || !utf8.ValidString(k[1]) || !utf8.ValidString(k[2]) {
+			return nil, false
+		}
+		pairs = prometheus.MakeLabelPairs(d.promDesc, []string{k[0], k[1], k[2]})
+		lc.mu.Lock()
+		if lc.cache3 == nil {
+			lc.cache3 = make(map[[3]string][]*dto.LabelPair, 64)
+		} else if len(lc.cache3) >= maxDescLabelCacheEntries {
+			clear(lc.cache3)
+		}
+		lc.cache3[k] = pairs
+		lc.mu.Unlock()
+		return pairs, true
+	case 4:
+		k := [4]string{labelValues[0], labelValues[1], labelValues[2], labelValues[3]}
+		lc.mu.RLock()
+		pairs, ok := lc.cache4[k]
+		lc.mu.RUnlock()
+		if ok {
+			return pairs, true
+		}
+		if !utf8.ValidString(k[0]) || !utf8.ValidString(k[1]) || !utf8.ValidString(k[2]) || !utf8.ValidString(k[3]) {
+			return nil, false
+		}
+		pairs = prometheus.MakeLabelPairs(d.promDesc, []string{k[0], k[1], k[2], k[3]})
+		lc.mu.Lock()
+		if lc.cache4 == nil {
+			lc.cache4 = make(map[[4]string][]*dto.LabelPair, 64)
+		} else if len(lc.cache4) >= maxDescLabelCacheEntries {
+			clear(lc.cache4)
+		}
+		lc.cache4[k] = pairs
+		lc.mu.Unlock()
+		return pairs, true
+	default:
+		for _, lv := range labelValues {
+			if !utf8.ValidString(lv) {
+				return nil, false
+			}
+		}
+		return prometheus.MakeLabelPairs(d.promDesc, slices.Clone(labelValues)), true
+	}
 }
 
 func (d *Desc) initializeDeprecatedDesc() {
