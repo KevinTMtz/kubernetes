@@ -101,8 +101,11 @@ func (s *secretManager) UnregisterPod(pod *v1.Pod) {
 }
 
 func getSecretNames(pod *v1.Pod) sets.Set[string] {
-	result := sets.New[string]()
+	var result sets.Set[string]
 	podutil.VisitPodSecretNames(pod, func(name string) bool {
+		if result == nil {
+			result = make(sets.Set[string], 4)
+		}
 		result.Insert(name)
 		return true
 	})

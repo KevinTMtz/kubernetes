@@ -134,8 +134,8 @@ func (pm *basicManager) SetPods(newPods []*v1.Pod) {
 	pm.lock.Lock()
 	defer pm.lock.Unlock()
 
-	pm.podByUID = make(map[kubetypes.ResolvedPodUID]*v1.Pod)
-	pm.podByFullName = make(map[string]*v1.Pod)
+	pm.podByUID = make(map[kubetypes.ResolvedPodUID]*v1.Pod, len(newPods))
+	pm.podByFullName = make(map[string]*v1.Pod, len(newPods))
 	pm.mirrorPodByUID = make(map[kubetypes.MirrorPodUID]*v1.Pod)
 	pm.mirrorPodByFullName = make(map[string]*v1.Pod)
 	pm.translationByUID = make(map[kubetypes.MirrorPodUID]kubetypes.ResolvedPodUID)
@@ -236,7 +236,7 @@ func (pm *basicManager) GetStaticPodToMirrorPodMap() map[*v1.Pod]*v1.Pod {
 	pm.lock.RLock()
 	defer pm.lock.RUnlock()
 	staticPodsMapToMirrorPods := make(map[*v1.Pod]*v1.Pod)
-	for _, pod := range podsMapToPods(pm.podByUID) {
+	for _, pod := range pm.podByUID {
 		if kubetypes.IsStaticPod(pod) {
 			staticPodsMapToMirrorPods[pod] = pm.mirrorPodByFullName[kubecontainer.GetPodFullName(pod)]
 		}

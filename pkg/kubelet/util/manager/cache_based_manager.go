@@ -105,7 +105,6 @@ func (s *objectStore) AddReference(namespace, name string, _ types.UID) {
 	if !exists {
 		item = &objectStoreItem{
 			refCount: 0,
-			data:     &objectData{},
 		}
 		s.items[key] = item
 	}
@@ -214,7 +213,7 @@ type cacheBasedManager struct {
 	getReferencedObjects func(*v1.Pod) sets.Set[string]
 
 	lock           sync.Mutex
-	registeredPods map[objectKey]*v1.Pod
+	registeredPods map[objectKey]sets.Set[string]
 }
 
 func (c *cacheBasedManager) GetObject(namespace, name string) (runtime.Object, error) {
@@ -225,18 +224,16 @@ func (c *cacheBasedManager) RegisterPod(pod *v1.Pod) {
 	names := c.getReferencedObjects(pod)
 	c.lock.Lock()
 	defer c.lock.Unlock()
-	var prev *v1.Pod
 	key := objectKey{namespace: pod.Namespace, name: pod.Name, uid: pod.UID}
-	prev = c.registeredPods[key]
-	c.registeredPods[key] = pod
+	prevNames, exists := c.registeredPods[key]
+	c.registeredPods[key] = names
 	// To minimize unnecessary API requests to the API server for the configmap/secret get API
 	// only invoke AddReference the first time RegisterPod is called for a pod.
-	if prev == nil {
+	if !exists {
 		for name := range names {
 			c.objectStore.AddReference(pod.Namespace, name, pod.UID)
 		}
 	} else {
-		prevNames := c.getReferencedObjects(prev)
 		// Add new references
 		for name := range names {
 			if !prevNames.Has(name) {
@@ -253,15 +250,14 @@ func (c *cacheBasedManager) RegisterPod(pod *v1.Pod) {
 }
 
 func (c *cacheBasedManager) UnregisterPod(pod *v1.Pod) {
-	var prev *v1.Pod
 	key := objectKey{namespace: pod.Namespace, name: pod.Name, uid: pod.UID}
 	c.lock.Lock()
 	defer c.lock.Unlock()
-	prev = c.registeredPods[key]
+	prevNames, exists := c.registeredPods[key]
 	delete(c.registeredPods, key)
-	if prev != nil {
-		for name := range c.getReferencedObjects(prev) {
-			c.objectStore.DeleteReference(prev.Namespace, name, prev.UID)
+	if exists {
+		for name := range prevNames {
+			c.objectStore.DeleteReference(pod.Namespace, name, pod.UID)
 		}
 	}
 }
@@ -278,6 +274,6 @@ func NewCacheBasedManager(objectStore Store, getReferencedObjects func(*v1.Pod) 
 	return &cacheBasedManager{
 		objectStore:          objectStore,
 		getReferencedObjects: getReferencedObjects,
-		registeredPods:       make(map[objectKey]*v1.Pod),
+		registeredPods:       make(map[objectKey]sets.Set[string]),
 	}
 }

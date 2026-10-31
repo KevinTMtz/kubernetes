@@ -56,7 +56,7 @@ func NewSourceApiserver(logger klog.Logger, c clientset.Interface, nodeName type
 // newSourceApiserverFromLW holds creates a config source that watches and pulls from the apiserver.
 func newSourceApiserverFromLW(lw cache.ListerWatcher, updates chan<- sourceUpdate) {
 	send := func(objs []interface{}) {
-		var pods []*v1.Pod
+		pods := make([]*v1.Pod, 0, len(objs))
 		for _, o := range objs {
 			pods = append(pods, o.(*v1.Pod))
 		}

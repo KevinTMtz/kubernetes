@@ -27,10 +27,10 @@ import (
 	"k8s.io/apimachinery/pkg/util/sets"
 	"k8s.io/client-go/tools/record"
 	"k8s.io/klog/v2"
-	kubecontainer "k8s.io/kubernetes/pkg/kubelet/container"
 	"k8s.io/kubernetes/pkg/kubelet/events"
 	kubetypes "k8s.io/kubernetes/pkg/kubelet/types"
 	"k8s.io/kubernetes/pkg/kubelet/util/format"
+	"k8s.io/utils/ptr"
 )
 
 type podStartupSLIObserver interface {
@@ -183,16 +183,13 @@ func (s *podStorage) merge(ctx context.Context, source string, update sourceUpda
 	defer s.podLock.Unlock()
 	logger := klog.FromContext(ctx)
 
-	addPods := []*v1.Pod{}
-	updatePods := []*v1.Pod{}
-	deletePods := []*v1.Pod{}
-	removePods := []*v1.Pod{}
-	reconcilePods := []*v1.Pod{}
+	var addPods []*v1.Pod
+	var updatePods []*v1.Pod
+	var deletePods []*v1.Pod
+	var removePods []*v1.Pod
+	var reconcilePods []*v1.Pod
 
-	pods := s.pods[source]
-	if pods == nil {
-		pods = make(map[types.UID]*v1.Pod)
-	}
+	oldPods := s.pods[source]
 
 	// updatePodFunc is the local function which updates the pod cache *oldPods* with new pods *newPods*.
 	// After updated, new pod will be stored in the pod cache *pods*.
@@ -202,9 +199,11 @@ func (s *podStorage) merge(ctx context.Context, source string, update sourceUpda
 		for _, ref := range filtered {
 			// Annotate the pod with the source before any comparison.
 			if ref.Annotations == nil {
-				ref.Annotations = make(map[string]string)
+				ref.Annotations = make(map[string]string, 2)
 			}
-			ref.Annotations[kubetypes.ConfigSourceAnnotationKey] = source
+			if ref.Annotations[kubetypes.ConfigSourceAnnotationKey] != source {
+				ref.Annotations[kubetypes.ConfigSourceAnnotationKey] = source
+			}
 			// ignore static pods
 			if !kubetypes.IsStaticPod(ref) {
 				s.startupSLIObserver.ObservedPodOnWatch(logger, ref, time.Now())
@@ -230,8 +229,7 @@ func (s *podStorage) merge(ctx context.Context, source string, update sourceUpda
 	logger.V(4).Info("Setting pods for source", "source", source)
 	s.markSourceSet(source)
 	// Clear the old map entries by just creating a new map
-	oldPods := pods
-	pods = make(map[types.UID]*v1.Pod)
+	pods := make(map[types.UID]*v1.Pod, len(update.Pods))
 	updatePodsFunc(update.Pods, oldPods, pods)
 	for uid, existing := range oldPods {
 		if _, found := pods[uid]; !found {
@@ -263,23 +261,41 @@ func (s *podStorage) seenSources(sources ...string) bool {
 	return s.sourcesSeen.HasAll(sources...)
 }
 
+type podFullNameKey struct {
+	name      string
+	namespace string
+}
+
 func filterInvalidPods(logger klog.Logger, pods []*v1.Pod, source string, recorder record.EventRecorderLogger) (filtered []*v1.Pod) {
-	names := sets.Set[string]{}
+	if len(pods) == 0 {
+		return nil
+	}
+	if len(pods) == 1 {
+		return pods
+	}
+	names := make(map[podFullNameKey]struct{}, len(pods))
 	for i, pod := range pods {
 		// Pods from each source are assumed to have passed validation individually.
 		// This function only checks if there is any naming conflict.
-		name := kubecontainer.GetPodFullName(pod)
-		if names.Has(name) {
+		key := podFullNameKey{name: pod.Name, namespace: pod.Namespace}
+		if _, exists := names[key]; exists {
 			logger.Info("Pod failed validation due to duplicate pod name, ignoring", "index", i, "pod", klog.KObj(pod), "source", source)
 			recorder.WithLogger(logger).Eventf(pod, v1.EventTypeWarning, events.FailedValidation, "Error validating pod %s from %s due to duplicate pod name %q, ignoring", format.Pod(pod), source, pod.Name)
+			if filtered == nil {
+				filtered = make([]*v1.Pod, i, len(pods)-1)
+				copy(filtered, pods[:i])
+			}
 			continue
-		} else {
-			names.Insert(name)
 		}
-
-		filtered = append(filtered, pod)
+		names[key] = struct{}{}
+		if filtered != nil {
+			filtered = append(filtered, pod)
+		}
 	}
-	return
+	if filtered == nil {
+		return pods
+	}
+	return filtered
 }
 
 // Annotations that the kubelet adds to the pod.
@@ -301,9 +317,6 @@ func isLocalAnnotationKey(key string) bool {
 // isAnnotationMapEqual returns true if the existing annotation Map is equal to candidate except
 // for local annotations.
 func isAnnotationMapEqual(existingMap, candidateMap map[string]string) bool {
-	if candidateMap == nil {
-		candidateMap = make(map[string]string)
-	}
 	for k, v := range candidateMap {
 		if isLocalAnnotationKey(k) {
 			continue
@@ -346,12 +359,27 @@ func updateAnnotations(existing, ref *v1.Pod) {
 	existing.Annotations = annotations
 }
 
+func stringMapEqual(a, b map[string]string) bool {
+	if (a == nil) != (b == nil) || len(a) != len(b) {
+		return false
+	}
+	for k, v := range a {
+		if bv, ok := b[k]; !ok || bv != v {
+			return false
+		}
+	}
+	return true
+}
+
 func podsDifferSemantically(existing, ref *v1.Pod) bool {
-	if reflect.DeepEqual(existing.Spec, ref.Spec) &&
-		reflect.DeepEqual(existing.Labels, ref.Labels) &&
+	if existing == ref {
+		return false
+	}
+	if stringMapEqual(existing.Labels, ref.Labels) &&
 		reflect.DeepEqual(existing.DeletionTimestamp, ref.DeletionTimestamp) &&
-		reflect.DeepEqual(existing.DeletionGracePeriodSeconds, ref.DeletionGracePeriodSeconds) &&
-		isAnnotationMapEqual(existing.Annotations, ref.Annotations) {
+		ptr.Equal(existing.DeletionGracePeriodSeconds, ref.DeletionGracePeriodSeconds) &&
+		isAnnotationMapEqual(existing.Annotations, ref.Annotations) &&
+		reflect.DeepEqual(&existing.Spec, &ref.Spec) {
 		return false
 	}
 	return true
@@ -364,6 +392,9 @@ func podsDifferSemantically(existing, ref *v1.Pod) bool {
 //   - else return all false
 //     Now, needUpdate, needGracefulDelete and needReconcile should never be both true
 func checkAndUpdatePod(existing, ref *v1.Pod) (needUpdate, needReconcile, needGracefulDelete bool) {
+	if existing == ref {
+		return false, false, false
+	}
 
 	// 1. this is a reconcile
 	// TODO: it would be better to update the whole object and only preserve certain things
@@ -372,7 +403,7 @@ func checkAndUpdatePod(existing, ref *v1.Pod) (needUpdate, needReconcile, needGr
 		// this is not an update
 		// Only check reconcile when it is not an update, because if the pod is going to
 		// be updated, an extra reconcile is unnecessary
-		if !reflect.DeepEqual(existing.Status, ref.Status) {
+		if !reflect.DeepEqual(&existing.Status, &ref.Status) {
 			// Pod with changed pod status needs reconcile, because kubelet should
 			// be the source of truth of pod status.
 			existing.Status = ref.Status
@@ -405,10 +436,10 @@ func checkAndUpdatePod(existing, ref *v1.Pod) (needUpdate, needReconcile, needGr
 }
 
 func copyPods(sourcePods []*v1.Pod) []*v1.Pod {
-	pods := []*v1.Pod{}
-	for _, source := range sourcePods {
+	pods := make([]*v1.Pod, len(sourcePods))
+	for i, source := range sourcePods {
 		// Use a deep copy here just in case
-		pods = append(pods, source.DeepCopy())
+		pods[i] = source.DeepCopy()
 	}
 	return pods
 }

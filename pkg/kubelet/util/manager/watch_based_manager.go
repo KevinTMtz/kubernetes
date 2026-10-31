@@ -52,8 +52,6 @@ type objectCacheItem struct {
 	store     *cacheStore
 	reflector *cache.Reflector
 
-	hasSynced func() (bool, error)
-
 	// waitGroup is used to ensure that there won't be two concurrent calls to reflector.Run
 	waitGroup sync.WaitGroup
 
@@ -64,6 +62,10 @@ type objectCacheItem struct {
 	stopped        bool
 	immutable      bool
 	stopCh         chan struct{}
+}
+
+func (i *objectCacheItem) hasSynced() (bool, error) {
+	return i.store.hasSynced(), nil
 }
 
 func (i *objectCacheItem) stop() bool {
@@ -127,27 +129,114 @@ func (i *objectCacheItem) startReflector() {
 	i.reflector.Run(i.stopCh)
 }
 
-// cacheStore is in order to rewrite Replace function to mark initialized flag
+// cacheStore is a dedicated single-object cache.Store implementation for objectCacheItem.
+// Each objectCacheItem watches at most a single (namespace, name) object.
 type cacheStore struct {
-	cache.Store
-	lock        sync.Mutex
+	lock        sync.RWMutex
+	obj         runtime.Object
+	exists      bool
 	initialized bool
+}
+
+func (c *cacheStore) Add(obj interface{}) error {
+	o, ok := obj.(runtime.Object)
+	if !ok {
+		return fmt.Errorf("unexpected object type: %T", obj)
+	}
+	c.lock.Lock()
+	c.obj = o
+	c.exists = true
+	c.lock.Unlock()
+	return nil
+}
+
+func (c *cacheStore) Update(obj interface{}) error {
+	return c.Add(obj)
+}
+
+func (c *cacheStore) Delete(obj interface{}) error {
+	c.lock.Lock()
+	c.obj = nil
+	c.exists = false
+	c.lock.Unlock()
+	return nil
+}
+
+func (c *cacheStore) List() []interface{} {
+	c.lock.RLock()
+	defer c.lock.RUnlock()
+	if !c.exists {
+		return nil
+	}
+	return []interface{}{c.obj}
+}
+
+func (c *cacheStore) ListKeys() []string {
+	c.lock.RLock()
+	defer c.lock.RUnlock()
+	if !c.exists {
+		return nil
+	}
+	if key, err := cache.MetaNamespaceKeyFunc(c.obj); err == nil {
+		return []string{key}
+	}
+	return nil
+}
+
+func (c *cacheStore) Get(obj interface{}) (interface{}, bool, error) {
+	key, err := cache.MetaNamespaceKeyFunc(obj)
+	if err != nil {
+		return nil, false, err
+	}
+	return c.GetByKey(key)
+}
+
+func (c *cacheStore) GetByKey(key string) (interface{}, bool, error) {
+	c.lock.RLock()
+	defer c.lock.RUnlock()
+	if !c.exists {
+		return nil, false, nil
+	}
+	objKey, err := cache.MetaNamespaceKeyFunc(c.obj)
+	if err != nil {
+		return nil, false, err
+	}
+	if objKey != key {
+		return nil, false, nil
+	}
+	return c.obj, true, nil
+}
+
+func (c *cacheStore) get() (runtime.Object, bool) {
+	c.lock.RLock()
+	defer c.lock.RUnlock()
+	return c.obj, c.exists
 }
 
 func (c *cacheStore) Replace(list []interface{}, resourceVersion string) error {
 	c.lock.Lock()
 	defer c.lock.Unlock()
-	err := c.Store.Replace(list, resourceVersion)
-	if err != nil {
-		return err
+	c.obj = nil
+	c.exists = false
+	for _, item := range list {
+		o, ok := item.(runtime.Object)
+		if !ok {
+			return fmt.Errorf("unexpected object type: %T", item)
+		}
+		c.obj = o
+		c.exists = true
 	}
 	c.initialized = true
 	return nil
 }
 
+func (c *cacheStore) Resync() error {
+	return nil
+}
+
 func (c *cacheStore) hasSynced() bool {
-	c.lock.Lock()
-	defer c.lock.Unlock()
+	c.lock.RLock()
+	defer c.lock.RUnlock()
 	return c.initialized
 }
 
@@ -210,17 +299,11 @@ func NewObjectCache(
 }
 
 func (c *objectCache) newStore() *cacheStore {
-	// TODO: We may consider created a dedicated store keeping just a single
-	// item, instead of using a generic store implementation for this purpose.
-	// However, simple benchmarks show that memory overhead in that case is
-	// decrease from ~600B to ~300B per object. So we are not optimizing it
-	// until we will see a good reason for that.
-	store := cache.NewStore(cache.MetaNamespaceKeyFunc)
-	return &cacheStore{store, sync.Mutex{}, false}
+	return &cacheStore{}
 }
 
 func (c *objectCache) newReflectorLocked(namespace, name string) *objectCacheItem {
-	fieldSelector := fields.Set{"metadata.name": name}.AsSelector().String()
+	fieldSelector := fields.OneTermEqualSelector("metadata.name", name).String()
 	listFunc := func(options metav1.ListOptions) (runtime.Object, error) {
 		options.FieldSelector = fieldSelector
 		return c.listObject(namespace, options)
@@ -245,7 +328,6 @@ func (c *objectCache) newReflectorLocked(namespace, name string) *objectCacheIte
 		refMap:    make(map[types.UID]int),
 		store:     store,
 		reflector: reflector,
-		hasSynced: func() (bool, error) { return store.hasSynced(), nil },
 		stopCh:    make(chan struct{}),
 	}
 
@@ -292,26 +374,12 @@ func (c *objectCache) DeleteReference(namespace, name string, referencedFrom typ
 	}
 }
 
-// key returns key of an object with a given name and namespace.
-// This has to be in-sync with cache.MetaNamespaceKeyFunc.
-func (c *objectCache) key(namespace, name string) string {
-	if len(namespace) > 0 {
-		return namespace + "/" + name
-	}
-	return name
-}
-
-func (c *objectCache) isStopped() bool {
-	c.lock.RLock()
-	defer c.lock.RUnlock()
-	return c.stopped
-}
-
 func (c *objectCache) Get(namespace, name string) (runtime.Object, error) {
 	key := objectKey{namespace: namespace, name: name}
 
 	c.lock.RLock()
 	item, exists := c.items[key]
+	stopped := c.stopped
 	c.lock.RUnlock()
 
 	if !exists {
@@ -322,20 +390,19 @@ func (c *objectCache) Get(namespace, name string) (runtime.Object, error) {
 	item.setLastAccessTime(c.clock.Now())
 
 	// Don't restart reflector if Kubelet is already shutting down.
-	if !c.isStopped() {
+	if !stopped {
 		item.restartReflectorIfNeeded()
 	}
-	if err := wait.PollImmediate(10*time.Millisecond, time.Second, item.hasSynced); err != nil {
-		return nil, fmt.Errorf("failed to sync %s cache: %v", c.groupResource.String(), err)
+	if !item.store.hasSynced() {
+		if err := wait.PollImmediate(10*time.Millisecond, time.Second, item.hasSynced); err != nil {
+			return nil, fmt.Errorf("failed to sync %s cache: %v", c.groupResource.String(), err)
+		}
 	}
-	obj, exists, err := item.store.GetByKey(c.key(namespace, name))
-	if err != nil {
-		return nil, err
-	}
+	object, exists := item.store.get()
 	if !exists {
 		return nil, apierrors.NewNotFound(c.groupResource, name)
 	}
-	if object, ok := obj.(runtime.Object); ok {
+	if object != nil {
 		// If the returned object is immutable, stop the reflector.
 		//
 		// NOTE: we may potentially not even start the reflector if the object is
@@ -357,7 +424,7 @@ func (c *objectCache) Get(namespace, name string) (runtime.Object, error) {
 		}
 		return object, nil
 	}
-	return nil, fmt.Errorf("unexpected object type: %v", obj)
+	return nil, fmt.Errorf("unexpected object type: %v", object)
 }
 
 func (c *objectCache) startRecycleIdleWatch() {
