@@ -51,7 +51,8 @@ import (
 
 const (
 	// CSIPluginName is the name of the in-tree CSI Plugin
-	CSIPluginName = "kubernetes.io/csi"
+	CSIPluginName        = "kubernetes.io/csi"
+	escapedCSIPluginName = "kubernetes.io~csi"
 
 	csiTimeout      = 2 * time.Minute
 	volNameSep      = "^"
@@ -441,7 +442,7 @@ func (p *csiPlugin) GetVolumeName(spec *volume.Spec) (string, error) {
 	}
 
 	// return driverName<separator>volumeHandle
-	return fmt.Sprintf("%s%s%s", csi.Driver, volNameSep, csi.VolumeHandle), nil
+	return csi.Driver + volNameSep + csi.VolumeHandle, nil
 }
 
 func (p *csiPlugin) CanSupport(spec *volume.Spec) bool {
@@ -460,12 +461,16 @@ func (p *csiPlugin) RequiresRemount(spec *volume.Spec) bool {
 	}
 	driverName, err := GetCSIDriverName(spec)
 	if err != nil {
-		klog.V(5).Info(log("Failed to mark %q as republish required, err: %v", spec.Name(), err))
+		if klogV := klog.V(5); klogV.Enabled() {
+			klogV.Info(log("Failed to mark %q as republish required, err: %v", spec.Name(), err))
+		}
 		return false
 	}
 	csiDriver, err := p.getCSIDriver(driverName)
 	if err != nil {
-		klog.V(5).Info(log("Failed to mark %q as republish required, err: %v", spec.Name(), err))
+		if klogV := klog.V(5); klogV.Enabled() {
+			klogV.Info(log("Failed to mark %q as republish required, err: %v", spec.Name(), err))
+		}
 		return false
 	}
 	return *csiDriver.Spec.RequiresRepublish
@@ -533,12 +538,16 @@ func (p *csiPlugin) NewMounter(
 
 	dir := mounter.GetPath()
 	mounter.MetricsProvider = NewMetricsCsi(volumeHandle, dir, csiDriverName(driverName))
-	klog.V(4).Info(log("mounter created successfully"))
+	if klogV := klog.V(4); klogV.Enabled() {
+		klogV.Info(log("mounter created successfully"))
+	}
 	return mounter, nil
 }
 
 func (p *csiPlugin) NewUnmounter(specName string, podUID types.UID) (volume.Unmounter, error) {
-	klog.V(4).Info(log("setting up unmounter for [name=%v, podUID=%v]", specName, podUID))
+	if klogV := klog.V(4); klogV.Enabled() {
+		klogV.Info(log("setting up unmounter for [name=%v, podUID=%v]", specName, podUID))
+	}
 
 	kvh, ok := p.host.(volume.KubeletVolumeHost)
 	if !ok {

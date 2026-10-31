@@ -154,6 +154,7 @@ func NewDesiredStateOfWorld(volumePluginMgr *volume.VolumePluginMgr, seLinuxTran
 	}
 	return &desiredStateOfWorld{
 		volumesToMount:    make(map[v1.UniqueVolumeName]volumeToMount),
+		podsToVolumes:     make(map[types.UniquePodName]map[v1.UniqueVolumeName]struct{}),
 		volumePluginMgr:   volumePluginMgr,
 		podErrors:         make(map[types.UniquePodName]sets.Set[string]),
 		seLinuxTranslator: seLinuxTranslator,
@@ -166,6 +167,12 @@ type desiredStateOfWorld struct {
 	// the map is the name of the volume and the value is a volume object
 	// containing more information about the volume.
 	volumesToMount map[v1.UniqueVolumeName]volumeToMount
+	// podsToVolumes indexes the volume names referenced by each pod for O(1) per-pod lookups.
+	podsToVolumes map[types.UniquePodName]map[v1.UniqueVolumeName]struct{}
+	// totalPodsToMount tracks the total number of (volume, pod) pairs across volumesToMount.
+	totalPodsToMount int
+	// cachedVolumesToMount holds an immutable snapshot of GetVolumesToMount(), invalidated on mutation.
+	cachedVolumesToMount []VolumeToMount
 	// volumePluginMgr is the volume plugin manager used to create volume
 	// plugin objects.
 	volumePluginMgr *volume.VolumePluginMgr
@@ -365,7 +372,10 @@ func (dsw *desiredStateOfWorld) AddPodToVolume(
 		outerVolumeSpecNames = oldPodMount.outerVolumeSpecNames
 	}
 	if !slices.Contains(outerVolumeSpecNames, outerVolumeSpecName) {
-		outerVolumeSpecNames = append(outerVolumeSpecNames, outerVolumeSpecName)
+		newOuter := make([]string, len(outerVolumeSpecNames)+1)
+		copy(newOuter, outerVolumeSpecNames)
+		newOuter[len(outerVolumeSpecNames)] = outerVolumeSpecName
+		outerVolumeSpecNames = newOuter
 	}
 
 	if !ok {
@@ -399,6 +409,19 @@ func (dsw *desiredStateOfWorld) AddPodToVolume(
 		outerVolumeSpecNames: outerVolumeSpecNames,
 		mountRequestTime:     mountRequestTime,
 	}
+	if !ok {
+		if dsw.podsToVolumes == nil {
+			dsw.podsToVolumes = make(map[types.UniquePodName]map[v1.UniqueVolumeName]struct{})
+		}
+		podVols := dsw.podsToVolumes[podName]
+		if podVols == nil {
+			podVols = make(map[v1.UniqueVolumeName]struct{})
+			dsw.podsToVolumes[podName] = podVols
+		}
+		podVols[volumeName] = struct{}{}
+		dsw.totalPodsToMount++
+	}
+	dsw.cachedVolumesToMount = nil
 	return volumeName, nil
 }
 
@@ -441,17 +464,31 @@ func (dsw *desiredStateOfWorld) MarkVolumesReportedInUse(
 	dsw.Lock()
 	defer dsw.Unlock()
 
-	reportedVolumesMap := make(
-		map[v1.UniqueVolumeName]bool, len(reportedVolumes) /* capacity */)
+	isSorted := slices.IsSorted(reportedVolumes)
+	var reportedVolumesMap map[v1.UniqueVolumeName]bool
+	if !isSorted && len(reportedVolumes) > 16 {
+		reportedVolumesMap = make(
+			map[v1.UniqueVolumeName]bool, len(reportedVolumes) /* capacity */)
 
-	for _, reportedVolume := range reportedVolumes {
-		reportedVolumesMap[reportedVolume] = true
+		for _, reportedVolume := range reportedVolumes {
+			reportedVolumesMap[reportedVolume] = true
+		}
 	}
 
 	for volumeName, volumeObj := range dsw.volumesToMount {
-		_, volumeReported := reportedVolumesMap[volumeName]
-		volumeObj.reportedInUse = volumeReported
-		dsw.volumesToMount[volumeName] = volumeObj
+		var volumeReported bool
+		if isSorted {
+			_, volumeReported = slices.BinarySearch(reportedVolumes, volumeName)
+		} else if reportedVolumesMap != nil {
+			volumeReported = reportedVolumesMap[volumeName]
+		} else {
+			volumeReported = slices.Contains(reportedVolumes, volumeName)
+		}
+		if volumeObj.reportedInUse != volumeReported {
+			volumeObj.reportedInUse = volumeReported
+			dsw.volumesToMount[volumeName] = volumeObj
+			dsw.cachedVolumesToMount = nil
+		}
 	}
 }
 
@@ -473,6 +510,14 @@ func (dsw *desiredStateOfWorld) DeletePodFromVolume(
 
 	// Delete pod if it exists
 	delete(dsw.volumesToMount[volumeName].podsToMount, podName)
+	dsw.totalPodsToMount--
+	if podVols, ok := dsw.podsToVolumes[podName]; ok {
+		delete(podVols, volumeName)
+		if len(podVols) == 0 {
+			delete(dsw.podsToVolumes, podName)
+		}
+	}
+	dsw.cachedVolumesToMount = nil
 
 	if len(dsw.volumesToMount[volumeName].podsToMount) == 0 {
 		// Delete volume if no child pods left
@@ -488,8 +533,11 @@ func (dsw *desiredStateOfWorld) UpdatePersistentVolumeSize(volumeName v1.UniqueV
 
 	vol, volExists := dsw.volumesToMount[volumeName]
 	if volExists {
-		vol.persistentVolumeSize = size
-		dsw.volumesToMount[volumeName] = vol
+		if vol.persistentVolumeSize.Cmp(size) != 0 {
+			vol.persistentVolumeSize = size.DeepCopy()
+			dsw.volumesToMount[volumeName] = vol
+			dsw.cachedVolumesToMount = nil
+		}
 	}
 }
 
@@ -547,10 +595,12 @@ func (dsw *desiredStateOfWorld) PodExistsInVolume(
 func (dsw *desiredStateOfWorld) VolumeExistsWithSpecName(podName types.UniquePodName, volumeSpecName string) bool {
 	dsw.RLock()
 	defer dsw.RUnlock()
-	for _, volumeObj := range dsw.volumesToMount {
-		if podObj, podExists := volumeObj.podsToMount[podName]; podExists {
-			if podObj.volumeSpec.Name() == volumeSpecName {
-				return true
+	for volumeName := range dsw.podsToVolumes[podName] {
+		if volumeObj, ok := dsw.volumesToMount[volumeName]; ok {
+			if podObj, podExists := volumeObj.podsToMount[podName]; podExists {
+				if podObj.volumeSpec.Name() == volumeSpecName {
+					return true
+				}
 			}
 		}
 	}
@@ -561,11 +611,9 @@ func (dsw *desiredStateOfWorld) GetPods() map[types.UniquePodName]bool {
 	dsw.RLock()
 	defer dsw.RUnlock()
 
-	podList := make(map[types.UniquePodName]bool)
-	for _, volumeObj := range dsw.volumesToMount {
-		for podName := range volumeObj.podsToMount {
-			podList[podName] = true
-		}
+	podList := make(map[types.UniquePodName]bool, len(dsw.podsToVolumes))
+	for podName := range dsw.podsToVolumes {
+		podList[podName] = true
 	}
 	return podList
 }
@@ -574,44 +622,170 @@ func (dsw *desiredStateOfWorld) GetVolumeNamesForPod(podName types.UniquePodName
 	dsw.RLock()
 	defer dsw.RUnlock()
 
-	volumeNames := make(map[string]v1.UniqueVolumeName)
-	for volumeName, volumeObj := range dsw.volumesToMount {
-		for _, outerVolumeSpecName := range volumeObj.podsToMount[podName].outerVolumeSpecNames {
-			volumeNames[outerVolumeSpecName] = volumeName
+	podVols := dsw.podsToVolumes[podName]
+	volumeNames := make(map[string]v1.UniqueVolumeName, len(podVols))
+	for volumeName := range podVols {
+		if volumeObj, ok := dsw.volumesToMount[volumeName]; ok {
+			for _, outerVolumeSpecName := range volumeObj.podsToMount[podName].outerVolumeSpecNames {
+				volumeNames[outerVolumeSpecName] = volumeName
+			}
 		}
 	}
 	return volumeNames
 }
 
-func (dsw *desiredStateOfWorld) GetVolumesToMount() []VolumeToMount {
+// CountPodOuterVolumes returns the number of outer volume spec names registered for podName.
+func (dsw *desiredStateOfWorld) CountPodOuterVolumes(podName types.UniquePodName) int {
 	dsw.RLock()
 	defer dsw.RUnlock()
 
-	volumesToMount := make([]VolumeToMount, 0 /* len */, len(dsw.volumesToMount) /* cap */)
+	count := 0
+	for volumeName := range dsw.podsToVolumes[podName] {
+		if volumeObj, ok := dsw.volumesToMount[volumeName]; ok {
+			count += len(volumeObj.podsToMount[podName].outerVolumeSpecNames)
+		}
+	}
+	return count
+}
+
+// ForEachPodOuterVolume invokes fn for each (outerVolumeSpecName, volumeName) belonging to podName.
+func (dsw *desiredStateOfWorld) ForEachPodOuterVolume(podName types.UniquePodName, fn func(outerVolumeSpecName string, volumeName v1.UniqueVolumeName)) {
+	dsw.RLock()
+	defer dsw.RUnlock()
+
+	for volumeName := range dsw.podsToVolumes[podName] {
+		if volumeObj, ok := dsw.volumesToMount[volumeName]; ok {
+			for _, outerVolumeSpecName := range volumeObj.podsToMount[podName].outerVolumeSpecNames {
+				fn(outerVolumeSpecName, volumeName)
+			}
+		}
+	}
+}
+
+// AppendAttachableVolumesInUse appends unique volume names of attachable volumes in DSW to dst.
+func (dsw *desiredStateOfWorld) AppendAttachableVolumesInUse(dst []v1.UniqueVolumeName) []v1.UniqueVolumeName {
+	dsw.RLock()
+	defer dsw.RUnlock()
+
+	for volumeName, volumeObj := range dsw.volumesToMount {
+		if volumeObj.pluginIsAttachable && len(volumeObj.podsToMount) > 0 {
+			dst = append(dst, volumeName)
+		}
+	}
+	return dst
+}
+
+// CountAttachableVolumes returns the count of attachable volumes in DSW.
+func (dsw *desiredStateOfWorld) CountAttachableVolumes() int {
+	dsw.RLock()
+	defer dsw.RUnlock()
+
+	count := 0
+	for _, volumeObj := range dsw.volumesToMount {
+		if volumeObj.pluginIsAttachable && len(volumeObj.podsToMount) > 0 {
+			count++
+		}
+	}
+	return count
+}
+
+// GetPodVolumesNotInDSW returns sorted expectedVolumes for podName that are not present in DSW.
+func (dsw *desiredStateOfWorld) GetPodVolumesNotInDSW(podName types.UniquePodName, expectedVolumes []string) []string {
+	volumesNotInDSW := sets.New(expectedVolumes...)
+
+	dsw.RLock()
+	for volumeName := range dsw.podsToVolumes[podName] {
+		if volumeObj, ok := dsw.volumesToMount[volumeName]; ok {
+			if podObj, podExists := volumeObj.podsToMount[podName]; podExists {
+				volumesNotInDSW.Delete(podObj.outerVolumeSpecNames...)
+			}
+		}
+	}
+	dsw.RUnlock()
+
+	return sets.List(volumesNotInDSW)
+}
+
+// GetPodUnattachedVolumes returns attachable volumes for podName that are not currently attached in asw.
+func (dsw *desiredStateOfWorld) GetPodUnattachedVolumes(podName types.UniquePodName, asw ActualStateOfWorld) []VolumeToMount {
+	dsw.RLock()
+	defer dsw.RUnlock()
+
+	unattachedVolumes := []VolumeToMount{}
+	for volumeName := range dsw.podsToVolumes[podName] {
+		volumeObj, ok := dsw.volumesToMount[volumeName]
+		if !ok || !volumeObj.pluginIsAttachable {
+			continue
+		}
+		podObj, podExists := volumeObj.podsToMount[podName]
+		if !podExists || asw.VolumeExists(volumeName) {
+			continue
+		}
+		unattachedVolumes = append(unattachedVolumes, VolumeToMount{
+			VolumeToMount: operationexecutor.VolumeToMount{
+				VolumeName:                  volumeName,
+				PodName:                     podName,
+				Pod:                         podObj.pod,
+				VolumeSpec:                  podObj.volumeSpec,
+				PluginIsAttachable:          volumeObj.pluginIsAttachable,
+				PluginIsDeviceMountable:     volumeObj.pluginIsDeviceMountable,
+				OuterVolumeSpecNames:        podObj.outerVolumeSpecNames,
+				VolumeGIDValue:              volumeObj.volumeGIDValue,
+				ReportedInUse:               volumeObj.reportedInUse,
+				MountRequestTime:            podObj.mountRequestTime,
+				DesiredSizeLimit:            volumeObj.desiredSizeLimit,
+				SELinuxLabel:                volumeObj.effectiveSELinuxMountFileLabel,
+				DesiredPersistentVolumeSize: volumeObj.persistentVolumeSize,
+			},
+		})
+	}
+	return unattachedVolumes
+}
+
+func (dsw *desiredStateOfWorld) GetVolumesToMount() []VolumeToMount {
+	dsw.RLock()
+	if dsw.cachedVolumesToMount != nil {
+		cached := dsw.cachedVolumesToMount
+		dsw.RUnlock()
+		return cached
+	}
+	dsw.RUnlock()
+
+	dsw.Lock()
+	defer dsw.Unlock()
+	if dsw.cachedVolumesToMount != nil {
+		return dsw.cachedVolumesToMount
+	}
+
+	capHint := dsw.totalPodsToMount
+	if capHint < len(dsw.volumesToMount) {
+		capHint = len(dsw.volumesToMount)
+	}
+	volumesToMount := make([]VolumeToMount, 0 /* len */, capHint /* cap */)
 	for volumeName, volumeObj := range dsw.volumesToMount {
 		for podName, podObj := range volumeObj.podsToMount {
 			vmt := VolumeToMount{
 				VolumeToMount: operationexecutor.VolumeToMount{
-					VolumeName:              volumeName,
-					PodName:                 podName,
-					Pod:                     podObj.pod,
-					VolumeSpec:              podObj.volumeSpec,
-					PluginIsAttachable:      volumeObj.pluginIsAttachable,
-					PluginIsDeviceMountable: volumeObj.pluginIsDeviceMountable,
-					OuterVolumeSpecNames:    podObj.outerVolumeSpecNames,
-					VolumeGIDValue:          volumeObj.volumeGIDValue,
-					ReportedInUse:           volumeObj.reportedInUse,
-					MountRequestTime:        podObj.mountRequestTime,
-					DesiredSizeLimit:        volumeObj.desiredSizeLimit,
-					SELinuxLabel:            volumeObj.effectiveSELinuxMountFileLabel,
+					VolumeName:                  volumeName,
+					PodName:                     podName,
+					Pod:                         podObj.pod,
+					VolumeSpec:                  podObj.volumeSpec,
+					PluginIsAttachable:          volumeObj.pluginIsAttachable,
+					PluginIsDeviceMountable:     volumeObj.pluginIsDeviceMountable,
+					OuterVolumeSpecNames:        podObj.outerVolumeSpecNames,
+					VolumeGIDValue:              volumeObj.volumeGIDValue,
+					ReportedInUse:               volumeObj.reportedInUse,
+					MountRequestTime:            podObj.mountRequestTime,
+					DesiredSizeLimit:            volumeObj.desiredSizeLimit,
+					SELinuxLabel:                volumeObj.effectiveSELinuxMountFileLabel,
+					DesiredPersistentVolumeSize: volumeObj.persistentVolumeSize,
 				},
-			}
-			if !volumeObj.persistentVolumeSize.IsZero() {
-				vmt.DesiredPersistentVolumeSize = volumeObj.persistentVolumeSize.DeepCopy()
 			}
 			volumesToMount = append(volumesToMount, vmt)
 		}
 	}
+	volumesToMount = slices.Clip(volumesToMount)
+	dsw.cachedVolumesToMount = volumesToMount
 	return volumesToMount
 }
 
@@ -657,8 +831,11 @@ func (dsw *desiredStateOfWorld) MarkVolumeAttachability(volumeName v1.UniqueVolu
 	if !volumeExists {
 		return
 	}
-	volumeObj.pluginIsAttachable = attachable
-	dsw.volumesToMount[volumeName] = volumeObj
+	if volumeObj.pluginIsAttachable != attachable {
+		volumeObj.pluginIsAttachable = attachable
+		dsw.volumesToMount[volumeName] = volumeObj
+		dsw.cachedVolumesToMount = nil
+	}
 }
 
 // Based on isRWOP, bump the right warning / error metric and either consume the error or return it.

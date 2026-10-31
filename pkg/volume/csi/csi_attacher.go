@@ -19,6 +19,7 @@ package csi
 import (
 	"context"
 	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"os"
@@ -252,7 +253,9 @@ func (c *csiAttacher) VolumesAreAttached(specs []*volume.Spec, nodeName types.No
 }
 
 func (c *csiAttacher) GetDeviceMountPath(spec *volume.Spec) (string, error) {
-	klog.V(4).Info(log("attacher.GetDeviceMountPath for volume(%s)", spec.Name()))
+	if klogV := klog.V(4); klogV.Enabled() {
+		klogV.Info(log("attacher.GetDeviceMountPath for volume(%s)", spec.Name()))
+	}
 	deviceMountPath, err := makeDeviceMountPath(c.plugin, spec)
 	if err != nil {
 		return "", errors.New(log("attacher.GetDeviceMountPath failed to make device mount path: %v", err))
@@ -262,7 +265,9 @@ func (c *csiAttacher) GetDeviceMountPath(spec *volume.Spec) (string, error) {
 }
 
 func (c *csiAttacher) MountDevice(spec *volume.Spec, devicePath string, deviceMountPath string, deviceMounterArgs volume.DeviceMounterArgs) error {
-	klog.V(4).Info(log("attacher.MountDevice(%s, %s)", devicePath, deviceMountPath))
+	if klogV := klog.V(4); klogV.Enabled() {
+		klogV.Info(log("attacher.MountDevice(%s, %s)", devicePath, deviceMountPath))
+	}
 
 	if deviceMountPath == "" {
 		return errors.New(log("attacher.MountDevice failed, deviceMountPath is empty"))
@@ -339,7 +344,9 @@ func (c *csiAttacher) MountDevice(spec *volume.Spec, devicePath string, deviceMo
 		return errors.New(log("attacher.MountDevice failed to create dir %#v:  %v", deviceMountPath, err))
 	}
 
-	klog.V(4).Info(log("created target path successfully [%s]", deviceMountPath))
+	if klogV := klog.V(4); klogV.Enabled() {
+		klogV.Info(log("created target path successfully [%s]", deviceMountPath))
+	}
 	dataDir := filepath.Dir(deviceMountPath)
 	data := map[string]string{
 		volDataKey.volHandle:  csiSource.VolumeHandle,
@@ -406,7 +413,9 @@ func (c *csiAttacher) MountDevice(spec *volume.Spec, devicePath string, deviceMo
 		return csiRPCError
 	}
 
-	klog.V(4).Info(log("attacher.MountDevice successfully requested NodeStageVolume [%s]", deviceMountPath))
+	if klogV := klog.V(4); klogV.Enabled() {
+		klogV.Info(log("attacher.MountDevice successfully requested NodeStageVolume [%s]", deviceMountPath))
+	}
 	return nil
 }
 
@@ -524,7 +533,9 @@ func (c *csiAttacher) waitForVolumeAttachDetachStatusWithLister(spec *volume.Spe
 }
 
 func (c *csiAttacher) UnmountDevice(deviceMountPath string) error {
-	klog.V(4).Info(log("attacher.UnmountDevice(%s)", deviceMountPath))
+	if klogV := klog.V(4); klogV.Enabled() {
+		klogV.Info(log("attacher.UnmountDevice(%s)", deviceMountPath))
+	}
 
 	// Setup
 	var driverName, volID string
@@ -535,7 +546,9 @@ func (c *csiAttacher) UnmountDevice(deviceMountPath string) error {
 		volID = data[volDataKey.volHandle]
 	} else {
 		if errors.Is(err, os.ErrNotExist) {
-			klog.V(4).Info(log("attacher.UnmountDevice skipped because volume data file [%s] does not exist", dataDir))
+			if klogV := klog.V(4); klogV.Enabled() {
+				klogV.Info(log("attacher.UnmountDevice skipped because volume data file [%s] does not exist", dataDir))
+			}
 			return nil
 		}
 
@@ -585,14 +598,16 @@ func (c *csiAttacher) UnmountDevice(deviceMountPath string) error {
 		return errors.New(log("failed to clean up global mount %s: %s", dataDir, err))
 	}
 
-	klog.V(4).Info(log("attacher.UnmountDevice successfully requested NodeUnStageVolume [%s]", deviceMountPath))
+	if klogV := klog.V(4); klogV.Enabled() {
+		klogV.Info(log("attacher.UnmountDevice successfully requested NodeUnStageVolume [%s]", deviceMountPath))
+	}
 	return nil
 }
 
 // getAttachmentName returns csi-<sha256(volName,csiDriverName,NodeName)>
 func getAttachmentName(volName, csiDriverName, nodeName string) string {
-	result := sha256.Sum256([]byte(fmt.Sprintf("%s%s%s", volName, csiDriverName, nodeName)))
-	return fmt.Sprintf("csi-%x", result)
+	result := sha256.Sum256([]byte(volName + csiDriverName + nodeName))
+	return "csi-" + hex.EncodeToString(result[:])
 }
 
 func makeDeviceMountPath(plugin *csiPlugin, spec *volume.Spec) (string, error) {
@@ -617,8 +632,8 @@ func makeDeviceMountPath(plugin *csiPlugin, spec *volume.Spec) (string, error) {
 		return "", errors.New("makeDeviceMountPath failed, CSIPersistentVolumeSource volume handle is empty")
 	}
 
-	result := sha256.Sum256([]byte(fmt.Sprintf("%s", csiSource.VolumeHandle)))
-	volSha := fmt.Sprintf("%x", result)
+	result := sha256.Sum256([]byte(csiSource.VolumeHandle))
+	volSha := hex.EncodeToString(result[:])
 	return filepath.Join(plugin.host.GetPluginDir(plugin.GetPluginName()), driver, volSha, globalMountInGlobalPath), nil
 }
 

@@ -153,7 +153,9 @@ func (rc *reconciler) unmountVolumes(logger klog.Logger) {
 		}
 		if !rc.desiredStateOfWorld.PodExistsInVolume(mountedVolume.PodName, mountedVolume.VolumeName, mountedVolume.SELinuxMountContext) {
 			// Volume is mounted, unmount it
-			logger.V(5).Info(mountedVolume.GenerateMsgDetailed("Starting operationExecutor.UnmountVolume", ""))
+			if loggerV := logger.V(5); loggerV.Enabled() {
+				loggerV.Info(mountedVolume.GenerateMsgDetailed("Starting operationExecutor.UnmountVolume", ""))
+			}
 			err := rc.operationExecutor.UnmountVolume(
 				mountedVolume.MountedVolume, rc.actualStateOfWorld, rc.kubeletPodsDir)
 			if err != nil && !isExpectedError(err) {
@@ -192,7 +194,9 @@ func (rc *reconciler) mountOrAttachVolumes(logger klog.Logger) {
 }
 
 func (rc *reconciler) expandVolume(logger klog.Logger, volumeToMount cache.VolumeToMount, currentSize resource.Quantity) {
-	logger.V(4).Info(volumeToMount.GenerateMsgDetailed("Starting operationExecutor.ExpandInUseVolume", ""), "pod", klog.KObj(volumeToMount.Pod))
+	if loggerV := logger.V(4); loggerV.Enabled() {
+		loggerV.Info(volumeToMount.GenerateMsgDetailed("Starting operationExecutor.ExpandInUseVolume", ""), "pod", klog.KObj(volumeToMount.Pod))
+	}
 	err := rc.operationExecutor.ExpandInUseVolume(volumeToMount.VolumeToMount, rc.actualStateOfWorld, currentSize)
 
 	if err != nil && !isExpectedError(err) {
@@ -200,7 +204,9 @@ func (rc *reconciler) expandVolume(logger klog.Logger, volumeToMount cache.Volum
 	}
 
 	if err == nil {
-		logger.V(4).Info(volumeToMount.GenerateMsgDetailed("operationExecutor.ExpandInUseVolume started", ""), "pod", klog.KObj(volumeToMount.Pod))
+		if loggerV := logger.V(4); loggerV.Enabled() {
+			loggerV.Info(volumeToMount.GenerateMsgDetailed("operationExecutor.ExpandInUseVolume started", ""), "pod", klog.KObj(volumeToMount.Pod))
+		}
 	}
 }
 
@@ -211,7 +217,9 @@ func (rc *reconciler) mountAttachedVolumes(logger klog.Logger, volumeToMount cac
 	if isRemount {
 		remountingLogStr = "Volume is already mounted to pod, but remount was requested."
 	}
-	logger.V(4).Info(volumeToMount.GenerateMsgDetailed("Starting operationExecutor.MountVolume", remountingLogStr), "pod", klog.KObj(volumeToMount.Pod))
+	if loggerV := logger.V(4); loggerV.Enabled() {
+		loggerV.Info(volumeToMount.GenerateMsgDetailed("Starting operationExecutor.MountVolume", remountingLogStr), "pod", klog.KObj(volumeToMount.Pod))
+	}
 	err := rc.operationExecutor.MountVolume(
 		rc.waitForAttachTimeout,
 		volumeToMount.VolumeToMount,
@@ -222,9 +230,13 @@ func (rc *reconciler) mountAttachedVolumes(logger klog.Logger, volumeToMount cac
 	}
 	if err == nil {
 		if remountingLogStr == "" {
-			logger.V(1).Info(volumeToMount.GenerateMsgDetailed("operationExecutor.MountVolume started", remountingLogStr), "pod", klog.KObj(volumeToMount.Pod))
+			if loggerV := logger.V(1); loggerV.Enabled() {
+				loggerV.Info(volumeToMount.GenerateMsgDetailed("operationExecutor.MountVolume started", remountingLogStr), "pod", klog.KObj(volumeToMount.Pod))
+			}
 		} else {
-			logger.V(5).Info(volumeToMount.GenerateMsgDetailed("operationExecutor.MountVolume started", remountingLogStr), "pod", klog.KObj(volumeToMount.Pod))
+			if loggerV := logger.V(5); loggerV.Enabled() {
+				loggerV.Info(volumeToMount.GenerateMsgDetailed("operationExecutor.MountVolume started", remountingLogStr), "pod", klog.KObj(volumeToMount.Pod))
+			}
 		}
 	}
 }
@@ -233,12 +245,16 @@ func (rc *reconciler) waitForVolumeAttach(logger klog.Logger, volumeToMount cach
 	if rc.controllerAttachDetachEnabled || !volumeToMount.PluginIsAttachable {
 		//// lets not spin a goroutine and unnecessarily trigger exponential backoff if this happens
 		if volumeToMount.PluginIsAttachable && !volumeToMount.ReportedInUse {
-			logger.V(5).Info(volumeToMount.GenerateMsgDetailed("operationExecutor.VerifyControllerAttachedVolume failed", " volume not marked in-use"), "pod", klog.KObj(volumeToMount.Pod))
+			if loggerV := logger.V(5); loggerV.Enabled() {
+				loggerV.Info(volumeToMount.GenerateMsgDetailed("operationExecutor.VerifyControllerAttachedVolume failed", " volume not marked in-use"), "pod", klog.KObj(volumeToMount.Pod))
+			}
 			return
 		}
 		// Volume is not attached (or doesn't implement attacher), kubelet attach is disabled, wait
 		// for controller to finish attaching volume.
-		logger.V(5).Info(volumeToMount.GenerateMsgDetailed("Starting operationExecutor.VerifyControllerAttachedVolume", ""), "pod", klog.KObj(volumeToMount.Pod))
+		if loggerV := logger.V(5); loggerV.Enabled() {
+			loggerV.Info(volumeToMount.GenerateMsgDetailed("Starting operationExecutor.VerifyControllerAttachedVolume", ""), "pod", klog.KObj(volumeToMount.Pod))
+		}
 		err := rc.operationExecutor.VerifyControllerAttachedVolume(
 			logger,
 			volumeToMount.VolumeToMount,
@@ -259,7 +275,9 @@ func (rc *reconciler) waitForVolumeAttach(logger klog.Logger, volumeToMount cach
 			NodeName:      rc.nodeName,
 			ScheduledPods: []*v1.Pod{volumeToMount.Pod},
 		}
-		logger.V(5).Info(volumeToAttach.GenerateMsgDetailed("Starting operationExecutor.AttachVolume", ""), "pod", klog.KObj(volumeToMount.Pod))
+		if loggerV := logger.V(5); loggerV.Enabled() {
+			loggerV.Info(volumeToAttach.GenerateMsgDetailed("Starting operationExecutor.AttachVolume", ""), "pod", klog.KObj(volumeToMount.Pod))
+		}
 		err := rc.operationExecutor.AttachVolume(logger, volumeToAttach, rc.actualStateOfWorld)
 		if err != nil && !isExpectedError(err) {
 			logger.Error(err, volumeToMount.GenerateErrorDetailed(fmt.Sprintf("operationExecutor.AttachVolume failed (controllerAttachDetachEnabled %v)", rc.controllerAttachDetachEnabled), err).Error(), "pod", klog.KObj(volumeToMount.Pod))
@@ -282,7 +300,9 @@ func (rc *reconciler) unmountDetachDevices(logger klog.Logger) {
 			attachedVolume, _ = rc.actualStateOfWorld.GetAttachedVolume(attachedVolume.VolumeName)
 			if attachedVolume.DeviceMayBeMounted() {
 				// Volume is globally mounted to device, unmount it
-				logger.V(5).Info(attachedVolume.GenerateMsgDetailed("Starting operationExecutor.UnmountDevice", ""))
+				if loggerV := logger.V(5); loggerV.Enabled() {
+					loggerV.Info(attachedVolume.GenerateMsgDetailed("Starting operationExecutor.UnmountDevice", ""))
+				}
 				err := rc.operationExecutor.UnmountDevice(
 					attachedVolume.AttachedVolume, rc.actualStateOfWorld, rc.hostutil)
 				if err != nil && !isExpectedError(err) {
@@ -299,7 +319,9 @@ func (rc *reconciler) unmountDetachDevices(logger klog.Logger) {
 					logger.Info(attachedVolume.GenerateMsgDetailed("Volume detached", fmt.Sprintf("DevicePath %q", attachedVolume.DevicePath)))
 				} else {
 					// Only detach if kubelet detach is enabled
-					logger.V(5).Info(attachedVolume.GenerateMsgDetailed("Starting operationExecutor.DetachVolume", ""))
+					if loggerV := logger.V(5); loggerV.Enabled() {
+						loggerV.Info(attachedVolume.GenerateMsgDetailed("Starting operationExecutor.DetachVolume", ""))
+					}
 					err := rc.operationExecutor.DetachVolume(
 						logger, attachedVolume.AttachedVolume, false /* verifySafeToDetach */, rc.actualStateOfWorld)
 					if err != nil && !isExpectedError(err) {

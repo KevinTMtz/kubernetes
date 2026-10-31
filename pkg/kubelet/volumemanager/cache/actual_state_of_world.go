@@ -22,6 +22,7 @@ package cache
 
 import (
 	"fmt"
+	"slices"
 	"sync"
 
 	v1 "k8s.io/api/core/v1"
@@ -229,6 +230,7 @@ func NewActualStateOfWorld(
 	return &actualStateOfWorld{
 		nodeName:                        nodeName,
 		attachedVolumes:                 make(map[v1.UniqueVolumeName]attachedVolume),
+		podsToVolumes:                   make(map[volumetypes.UniquePodName]map[v1.UniqueVolumeName]struct{}),
 		foundDuringReconstruction:       make(map[v1.UniqueVolumeName]map[volumetypes.UniquePodName]types.UID),
 		attemptedMounts:                 make(map[volumetypes.UniquePodName]sets.Set[v1.UniqueVolumeName]),
 		volumePluginMgr:                 volumePluginMgr,
@@ -261,6 +263,13 @@ type actualStateOfWorld struct {
 	// The key in this map is the name of the volume and the value is an object
 	// containing more information about the attached volume.
 	attachedVolumes map[v1.UniqueVolumeName]attachedVolume
+	// podsToVolumes indexes attached volume names by mounted/uncertain pod name for O(1) per-pod queries.
+	podsToVolumes map[volumetypes.UniquePodName]map[v1.UniqueVolumeName]struct{}
+	// totalMountedPods tracks the total number of (volume, pod) entries across attachedVolumes.
+	totalMountedPods int
+	// cachedMountedVolumes and cachedAllMountedVolumes hold immutable snapshots invalidated on write.
+	cachedMountedVolumes    []MountedVolume
+	cachedAllMountedVolumes []MountedVolume
 	// foundDuringReconstruction is a map of volumes which were discovered
 	// from kubelet root directory when kubelet was restarted.
 	foundDuringReconstruction map[v1.UniqueVolumeName]map[volumetypes.UniquePodName]types.UID
@@ -276,6 +285,38 @@ type actualStateOfWorld struct {
 	// plugin objects.
 	volumePluginMgr *volume.VolumePluginMgr
 	sync.RWMutex
+}
+
+func (asw *actualStateOfWorld) addPodVolumeIndexLocked(podName volumetypes.UniquePodName, volumeName v1.UniqueVolumeName) {
+	if asw.podsToVolumes == nil {
+		asw.podsToVolumes = make(map[volumetypes.UniquePodName]map[v1.UniqueVolumeName]struct{})
+	}
+	podVols := asw.podsToVolumes[podName]
+	if podVols == nil {
+		podVols = make(map[v1.UniqueVolumeName]struct{})
+		asw.podsToVolumes[podName] = podVols
+	}
+	if _, exists := podVols[volumeName]; !exists {
+		podVols[volumeName] = struct{}{}
+		asw.totalMountedPods++
+	}
+}
+
+func (asw *actualStateOfWorld) removePodVolumeIndexLocked(podName volumetypes.UniquePodName, volumeName v1.UniqueVolumeName) {
+	if podVols, ok := asw.podsToVolumes[podName]; ok {
+		if _, exists := podVols[volumeName]; exists {
+			delete(podVols, volumeName)
+			asw.totalMountedPods--
+			if len(podVols) == 0 {
+				delete(asw.podsToVolumes, podName)
+			}
+		}
+	}
+}
+
+func (asw *actualStateOfWorld) invalidateMountedVolumesCacheLocked() {
+	asw.cachedMountedVolumes = nil
+	asw.cachedAllMountedVolumes = nil
 }
 
 type volumeAttachability string
@@ -508,6 +549,10 @@ func (asw *actualStateOfWorld) CheckAndMarkVolumeAsUncertainViaReconstruction(op
 	}
 
 	asw.attachedVolumes[volumeName].mountedPods[podName] = podObj
+	if !podExists {
+		asw.addPodVolumeIndexLocked(podName, volumeName)
+	}
+	asw.invalidateMountedVolumesCacheLocked()
 
 	podMap, ok := asw.foundDuringReconstruction[opts.VolumeName]
 	if !ok {
@@ -537,6 +582,7 @@ func (asw *actualStateOfWorld) CheckAndMarkDeviceUncertainViaReconstruction(volu
 	// determined from node object.
 	volumeObj.deviceMountPath = deviceMountPath
 	asw.attachedVolumes[volumeName] = volumeObj
+	asw.invalidateMountedVolumesCacheLocked()
 	return true
 
 }
@@ -793,6 +839,7 @@ func (asw *actualStateOfWorld) addVolume(logger klog.Logger,
 		// If volume object already exists, update the fields such as device path
 		volumeObj.devicePath = devicePath
 		logger.V(2).Info("Volume is already added to attachedVolume list, update device path", "volumeName", volumeName, "path", devicePath)
+		asw.invalidateMountedVolumesCacheLocked()
 	}
 	asw.attachedVolumes[volumeName] = volumeObj
 
@@ -854,6 +901,9 @@ func (asw *actualStateOfWorld) AddPodToVolume(markVolumeOpts operationexecutor.M
 		podObj.mounter = mounter
 	}
 	asw.attachedVolumes[volumeName].mountedPods[podName] = podObj
+	if !podExists {
+		asw.addPodVolumeIndexLocked(podName, volumeName)
+	}
 	if utilfeature.DefaultFeatureGate.Enabled(features.SELinuxMountReadWriteOncePod) {
 		// Store the mount context also in the AttachedVolume to have a global volume context
 		// for a quick comparison in PodExistsInVolume.
@@ -862,6 +912,7 @@ func (asw *actualStateOfWorld) AddPodToVolume(markVolumeOpts operationexecutor.M
 			asw.attachedVolumes[volumeName] = volumeObj
 		}
 	}
+	asw.invalidateMountedVolumesCacheLocked()
 
 	return nil
 }
@@ -884,7 +935,11 @@ func (asw *actualStateOfWorld) MarkRemountRequired(
 	podName volumetypes.UniquePodName) {
 	asw.Lock()
 	defer asw.Unlock()
-	for volumeName, volumeObj := range asw.attachedVolumes {
+	for volumeName := range asw.podsToVolumes[podName] {
+		volumeObj, volumeExists := asw.attachedVolumes[volumeName]
+		if !volumeExists {
+			continue
+		}
 		if podObj, podExists := volumeObj.mountedPods[podName]; podExists {
 			volumePlugin, err :=
 				asw.volumePluginMgr.FindPluginBySpec(podObj.volumeSpec)
@@ -926,6 +981,7 @@ func (asw *actualStateOfWorld) SetDeviceMountState(
 	}
 
 	asw.attachedVolumes[volumeName] = volumeObj
+	asw.invalidateMountedVolumesCacheLocked()
 	return nil
 }
 
@@ -968,6 +1024,8 @@ func (asw *actualStateOfWorld) DeletePodFromVolume(
 	_, podExists := volumeObj.mountedPods[podName]
 	if podExists {
 		delete(asw.attachedVolumes[volumeName].mountedPods, podName)
+		asw.removePodVolumeIndexLocked(podName, volumeName)
+		asw.invalidateMountedVolumesCacheLocked()
 	}
 
 	// if there were reconstructed volumes, we should remove them
@@ -1000,6 +1058,7 @@ func (asw *actualStateOfWorld) DeleteVolume(volumeName v1.UniqueVolumeName) erro
 	delete(asw.attachedVolumes, volumeName)
 	delete(asw.foundDuringReconstruction, volumeName)
 	asw.clearVolumeMountAttemptedForVolumeLocked(volumeName)
+	asw.invalidateMountedVolumesCacheLocked()
 	return nil
 }
 
@@ -1040,7 +1099,8 @@ func (asw *actualStateOfWorld) PodExistsInVolume(logger klog.Logger, podName vol
 func (asw *actualStateOfWorld) PodHasMountedVolumes(podName volumetypes.UniquePodName) bool {
 	asw.RLock()
 	defer asw.RUnlock()
-	for _, volumeObj := range asw.attachedVolumes {
+	for volumeName := range asw.podsToVolumes[podName] {
+		volumeObj := asw.attachedVolumes[volumeName]
 		if podObj, hasPod := volumeObj.mountedPods[podName]; hasPod {
 			if podObj.volumeMountStateForPod == operationexecutor.VolumeMounted {
 				return true
@@ -1051,16 +1111,73 @@ func (asw *actualStateOfWorld) PodHasMountedVolumes(podName volumetypes.UniquePo
 	return false
 }
 
-func (asw *actualStateOfWorld) volumeNeedsExpansion(logger klog.Logger, volumeObj attachedVolume, desiredVolumeSize resource.Quantity) (resource.Quantity, bool) {
-	currentSize := volumeObj.persistentVolumeSize.DeepCopy()
-	if volumeObj.volumeInUseErrorForExpansion {
-		return currentSize, false
-	}
-	if volumeObj.persistentVolumeSize.IsZero() || desiredVolumeSize.IsZero() {
-		return currentSize, false
+// PodHasPossiblyMountedVolumes returns true if any volume for podName is in VolumeMounted or VolumeMountUncertain state.
+func (asw *actualStateOfWorld) PodHasPossiblyMountedVolumes(podName volumetypes.UniquePodName) bool {
+	asw.RLock()
+	defer asw.RUnlock()
+	for volumeName := range asw.podsToVolumes[podName] {
+		volumeObj := asw.attachedVolumes[volumeName]
+		if podObj, hasPod := volumeObj.mountedPods[podName]; hasPod {
+			if podObj.volumeMountStateForPod == operationexecutor.VolumeMounted ||
+				podObj.volumeMountStateForPod == operationexecutor.VolumeMountUncertain {
+				return true
+			}
+		}
 	}
 
-	logger.V(5).Info("NodeExpandVolume checking size", "actualSize", volumeObj.persistentVolumeSize.String(), "desiredSize", desiredVolumeSize.String(), "volume", volumeObj.volumeName)
+	return false
+}
+
+// ForEachMountedVolumeGIDForPod invokes fn for each non-empty VolumeGIDValue on volumes mounted to podName.
+func (asw *actualStateOfWorld) ForEachMountedVolumeGIDForPod(podName volumetypes.UniquePodName, fn func(volumeGIDValue string)) {
+	asw.RLock()
+	defer asw.RUnlock()
+	for volumeName := range asw.podsToVolumes[podName] {
+		volumeObj := asw.attachedVolumes[volumeName]
+		if podObj, hasPod := volumeObj.mountedPods[podName]; hasPod {
+			if podObj.volumeMountStateForPod == operationexecutor.VolumeMounted && podObj.volumeGIDValue != "" {
+				fn(podObj.volumeGIDValue)
+			}
+		}
+	}
+}
+
+// AppendAttachableVolumes appends unique volume names of attachable volumes in ASW to dst.
+func (asw *actualStateOfWorld) AppendAttachableVolumes(dst []v1.UniqueVolumeName) []v1.UniqueVolumeName {
+	asw.RLock()
+	defer asw.RUnlock()
+	for volumeName, volumeObj := range asw.attachedVolumes {
+		if volumeObj.pluginIsAttachable == volumeAttachabilityTrue {
+			dst = append(dst, volumeName)
+		}
+	}
+	return dst
+}
+
+// CountAttachableVolumes returns the count of attachable volumes in ASW.
+func (asw *actualStateOfWorld) CountAttachableVolumes() int {
+	asw.RLock()
+	defer asw.RUnlock()
+	count := 0
+	for _, volumeObj := range asw.attachedVolumes {
+		if volumeObj.pluginIsAttachable == volumeAttachabilityTrue {
+			count++
+		}
+	}
+	return count
+}
+
+func (asw *actualStateOfWorld) volumeNeedsExpansion(logger klog.Logger, volumeObj attachedVolume, desiredVolumeSize resource.Quantity) (resource.Quantity, bool) {
+	if volumeObj.volumeInUseErrorForExpansion {
+		return resource.Quantity{}, false
+	}
+	if volumeObj.persistentVolumeSize.IsZero() || desiredVolumeSize.IsZero() {
+		return resource.Quantity{}, false
+	}
+
+	if loggerV := logger.V(5); loggerV.Enabled() {
+		loggerV.Info("NodeExpandVolume checking size", "actualSize", volumeObj.persistentVolumeSize.String(), "desiredSize", desiredVolumeSize.String(), "volume", volumeObj.volumeName)
+	}
 
 	if desiredVolumeSize.Cmp(volumeObj.persistentVolumeSize) > 0 {
 		volumePlugin, err := asw.volumePluginMgr.FindNodeExpandablePluginBySpec(volumeObj.spec)
@@ -1069,13 +1186,13 @@ func (asw *actualStateOfWorld) volumeNeedsExpansion(logger klog.Logger, volumeOb
 			logger.Info("PodExistsInVolume failed to find expandable plugin",
 				"volume", volumeObj.volumeName,
 				"volumeSpecName", volumeObj.spec.Name())
-			return currentSize, false
+			return resource.Quantity{}, false
 		}
 		if volumePlugin.RequiresFSResize() {
-			return currentSize, true
+			return volumeObj.persistentVolumeSize.DeepCopy(), true
 		}
 	}
-	return currentSize, false
+	return resource.Quantity{}, false
 }
 
 func (asw *actualStateOfWorld) PodRemovedFromVolume(
@@ -1105,7 +1222,8 @@ func (asw *actualStateOfWorld) PodRemovedFromVolume(
 func (asw *actualStateOfWorld) VolumeExistsWithSpecName(podName volumetypes.UniquePodName, volumeSpecName string) bool {
 	asw.RLock()
 	defer asw.RUnlock()
-	for _, volumeObj := range asw.attachedVolumes {
+	for volumeName := range asw.podsToVolumes[podName] {
+		volumeObj := asw.attachedVolumes[volumeName]
 		if podObj, podExists := volumeObj.mountedPods[podName]; podExists {
 			if podObj.volumeSpec.Name() == volumeSpecName {
 				return true
@@ -1126,8 +1244,24 @@ func (asw *actualStateOfWorld) VolumeExists(
 
 func (asw *actualStateOfWorld) GetMountedVolumes() []MountedVolume {
 	asw.RLock()
-	defer asw.RUnlock()
-	mountedVolume := make([]MountedVolume, 0 /* len */, len(asw.attachedVolumes) /* cap */)
+	if asw.cachedMountedVolumes != nil {
+		cached := asw.cachedMountedVolumes
+		asw.RUnlock()
+		return cached
+	}
+	asw.RUnlock()
+
+	asw.Lock()
+	defer asw.Unlock()
+	if asw.cachedMountedVolumes != nil {
+		return asw.cachedMountedVolumes
+	}
+
+	capHint := asw.totalMountedPods
+	if capHint < len(asw.attachedVolumes) {
+		capHint = len(asw.attachedVolumes)
+	}
+	mountedVolume := make([]MountedVolume, 0 /* len */, capHint /* cap */)
 	for _, volumeObj := range asw.attachedVolumes {
 		for _, podObj := range volumeObj.mountedPods {
 			if podObj.volumeMountStateForPod == operationexecutor.VolumeMounted {
@@ -1137,14 +1271,32 @@ func (asw *actualStateOfWorld) GetMountedVolumes() []MountedVolume {
 			}
 		}
 	}
+	mountedVolume = slices.Clip(mountedVolume)
+	asw.cachedMountedVolumes = mountedVolume
 	return mountedVolume
 }
 
 // GetAllMountedVolumes returns all volumes which could be locally mounted for a pod.
 func (asw *actualStateOfWorld) GetAllMountedVolumes() []MountedVolume {
 	asw.RLock()
-	defer asw.RUnlock()
-	mountedVolume := make([]MountedVolume, 0 /* len */, len(asw.attachedVolumes) /* cap */)
+	if asw.cachedAllMountedVolumes != nil {
+		cached := asw.cachedAllMountedVolumes
+		asw.RUnlock()
+		return cached
+	}
+	asw.RUnlock()
+
+	asw.Lock()
+	defer asw.Unlock()
+	if asw.cachedAllMountedVolumes != nil {
+		return asw.cachedAllMountedVolumes
+	}
+
+	capHint := asw.totalMountedPods
+	if capHint < len(asw.attachedVolumes) {
+		capHint = len(asw.attachedVolumes)
+	}
+	mountedVolume := make([]MountedVolume, 0 /* len */, capHint /* cap */)
 	for _, volumeObj := range asw.attachedVolumes {
 		for _, podObj := range volumeObj.mountedPods {
 			if podObj.volumeMountStateForPod == operationexecutor.VolumeMounted ||
@@ -1155,7 +1307,8 @@ func (asw *actualStateOfWorld) GetAllMountedVolumes() []MountedVolume {
 			}
 		}
 	}
-
+	mountedVolume = slices.Clip(mountedVolume)
+	asw.cachedAllMountedVolumes = mountedVolume
 	return mountedVolume
 }
 
@@ -1163,14 +1316,18 @@ func (asw *actualStateOfWorld) GetMountedVolumesForPod(
 	podName volumetypes.UniquePodName) []MountedVolume {
 	asw.RLock()
 	defer asw.RUnlock()
-	mountedVolume := make([]MountedVolume, 0 /* len */)
-	for _, volumeObj := range asw.attachedVolumes {
-		for mountedPodName, podObj := range volumeObj.mountedPods {
-			if mountedPodName == podName && podObj.volumeMountStateForPod == operationexecutor.VolumeMounted {
-				mountedVolume = append(
-					mountedVolume,
-					getMountedVolume(&podObj, &volumeObj))
-			}
+	podVols := asw.podsToVolumes[podName]
+	if len(podVols) == 0 {
+		return nil
+	}
+	mountedVolume := make([]MountedVolume, 0 /* len */, len(podVols) /* cap */)
+	for volumeName := range podVols {
+		volumeObj := asw.attachedVolumes[volumeName]
+		if podObj, hasPod := volumeObj.mountedPods[podName]; hasPod &&
+			podObj.volumeMountStateForPod == operationexecutor.VolumeMounted {
+			mountedVolume = append(
+				mountedVolume,
+				getMountedVolume(&podObj, &volumeObj))
 		}
 	}
 
@@ -1195,16 +1352,19 @@ func (asw *actualStateOfWorld) GetPossiblyMountedVolumesForPod(
 	podName volumetypes.UniquePodName) []MountedVolume {
 	asw.RLock()
 	defer asw.RUnlock()
-	mountedVolume := make([]MountedVolume, 0 /* len */, len(asw.attachedVolumes) /* cap */)
-	for _, volumeObj := range asw.attachedVolumes {
-		for mountedPodName, podObj := range volumeObj.mountedPods {
-			if mountedPodName == podName &&
-				(podObj.volumeMountStateForPod == operationexecutor.VolumeMounted ||
-					podObj.volumeMountStateForPod == operationexecutor.VolumeMountUncertain) {
-				mountedVolume = append(
-					mountedVolume,
-					getMountedVolume(&podObj, &volumeObj))
-			}
+	podVols := asw.podsToVolumes[podName]
+	if len(podVols) == 0 {
+		return nil
+	}
+	mountedVolume := make([]MountedVolume, 0 /* len */, len(podVols) /* cap */)
+	for volumeName := range podVols {
+		volumeObj := asw.attachedVolumes[volumeName]
+		if podObj, hasPod := volumeObj.mountedPods[podName]; hasPod &&
+			(podObj.volumeMountStateForPod == operationexecutor.VolumeMounted ||
+				podObj.volumeMountStateForPod == operationexecutor.VolumeMountUncertain) {
+			mountedVolume = append(
+				mountedVolume,
+				getMountedVolume(&podObj, &volumeObj))
 		}
 	}
 
@@ -1256,9 +1416,12 @@ func (asw *actualStateOfWorld) GetAttachedVolume(volumeName v1.UniqueVolumeName)
 func (asw *actualStateOfWorld) GetUnmountedVolumes() []AttachedVolume {
 	asw.RLock()
 	defer asw.RUnlock()
-	unmountedVolumes := make([]AttachedVolume, 0 /* len */, len(asw.attachedVolumes) /* cap */)
+	var unmountedVolumes []AttachedVolume
 	for _, volumeObj := range asw.attachedVolumes {
 		if len(volumeObj.mountedPods) == 0 {
+			if unmountedVolumes == nil {
+				unmountedVolumes = make([]AttachedVolume, 0, 4)
+			}
 			unmountedVolumes = append(
 				unmountedVolumes,
 				asw.newAttachedVolume(&volumeObj))

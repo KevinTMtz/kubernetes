@@ -117,6 +117,7 @@ func NewDesiredStateOfWorldPopulator(
 		csiMigratedPluginManager: csiMigratedPluginManager,
 		intreeToCSITranslator:    intreeToCSITranslator,
 		volumePluginMgr:          volumePluginMgr,
+		podsFromCache:            make(map[volumetypes.UniquePodName]struct{}),
 	}
 }
 
@@ -133,6 +134,8 @@ type desiredStateOfWorldPopulator struct {
 	csiMigratedPluginManager csimigration.PluginManager
 	intreeToCSITranslator    csimigration.InTreeToCSITranslator
 	volumePluginMgr          *volume.VolumePluginMgr
+	podsFromCache            map[volumetypes.UniquePodName]struct{}
+	orphanedPods             []volumetypes.UniquePodName
 }
 
 type processedPods struct {
@@ -198,7 +201,13 @@ func (dswp *desiredStateOfWorldPopulator) findAndAddNewPods(ctx context.Context)
 // Iterate through all pods in desired state of world, and remove if they no
 // longer exist
 func (dswp *desiredStateOfWorldPopulator) findAndRemoveDeletedPods(logger klog.Logger) {
-	podsFromCache := make(map[volumetypes.UniquePodName]struct{})
+	podsFromCache := dswp.podsFromCache
+	if podsFromCache == nil {
+		podsFromCache = make(map[volumetypes.UniquePodName]struct{})
+		dswp.podsFromCache = podsFromCache
+	} else {
+		clear(podsFromCache)
+	}
 	for _, volumeToMount := range dswp.desiredStateOfWorld.GetVolumesToMount() {
 		podsFromCache[volumetypes.UniquePodName(volumeToMount.Pod.UID)] = struct{}{}
 		pod, podExists := dswp.podManager.GetPodByUID(volumeToMount.Pod.UID)
@@ -248,14 +257,15 @@ func (dswp *desiredStateOfWorldPopulator) findAndRemoveDeletedPods(logger klog.L
 	}
 
 	// Cleanup orphanded entries from processedPods
+	orphanedPods := dswp.orphanedPods[:0]
 	dswp.pods.Lock()
-	orphanedPods := make([]volumetypes.UniquePodName, 0, len(dswp.pods.processedPods))
 	for k := range dswp.pods.processedPods {
 		if _, ok := podsFromCache[k]; !ok {
 			orphanedPods = append(orphanedPods, k)
 		}
 	}
 	dswp.pods.Unlock()
+	dswp.orphanedPods = orphanedPods
 	for _, orphanedPod := range orphanedPods {
 		uid := types.UID(orphanedPod)
 		_, podExists := dswp.podManager.GetPodByUID(uid)
@@ -368,7 +378,9 @@ func (dswp *desiredStateOfWorldPopulator) checkVolumeFSResize(
 	pvCap := volumeSpec.PersistentVolume.Spec.Capacity.Storage().DeepCopy()
 	pvcStatusCap := pvc.Status.Capacity.Storage().DeepCopy()
 	dswp.desiredStateOfWorld.UpdatePersistentVolumeSize(uniqueVolumeName, pvCap)
-	logger.V(5).Info("NodeExpandVolume updating size", "actualSize", pvcStatusCap.String(), "desiredSize", pvCap.String(), "volumeName", uniqueVolumeName)
+	if loggerV := logger.V(5); loggerV.Enabled() {
+		loggerV.Info("NodeExpandVolume updating size", "actualSize", pvcStatusCap.String(), "desiredSize", pvCap.String(), "volumeName", uniqueVolumeName)
+	}
 	// in case the actualStateOfWorld was rebuild after kubelet restart ensure that claimSize is set to accurate value
 	dswp.actualStateOfWorld.InitializeClaimSize(logger, uniqueVolumeName, pvcStatusCap)
 }

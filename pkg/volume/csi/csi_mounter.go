@@ -18,6 +18,7 @@ package csi
 
 import (
 	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -84,13 +85,15 @@ var _ volume.Volume = &csiMountMgr{}
 
 func (c *csiMountMgr) GetPath() string {
 	dir := GetCSIMounterPath(filepath.Join(getTargetPath(c.podUID, c.specVolumeID, c.plugin.host)))
-	klog.V(4).Info(log("mounter.GetPath generated [%s]", dir))
+	if klogV := klog.V(4); klogV.Enabled() {
+		klogV.Info(log("mounter.GetPath generated [%s]", dir))
+	}
 	return dir
 }
 
 func getTargetPath(uid types.UID, specVolumeID string, host volume.VolumeHost) string {
 	specVolID := utilstrings.EscapeQualifiedName(specVolumeID)
-	return host.GetPodVolumeDir(uid, utilstrings.EscapeQualifiedName(CSIPluginName), specVolID)
+	return host.GetPodVolumeDir(uid, escapedCSIPluginName, specVolID)
 }
 
 // volume.Mounter methods
@@ -101,7 +104,9 @@ func (c *csiMountMgr) SetUp(mounterArgs volume.MounterArgs) error {
 }
 
 func (c *csiMountMgr) SetUpAt(dir string, mounterArgs volume.MounterArgs) error {
-	klog.V(4).Info(log("Mounter.SetUpAt(%s)", dir))
+	if klogV := klog.V(4); klogV.Enabled() {
+		klogV.Info(log("Mounter.SetUpAt(%s)", dir))
+	}
 
 	csi, err := c.csiClientGetter.Get()
 	if err != nil {
@@ -213,7 +218,9 @@ func (c *csiMountMgr) SetUpAt(dir string, mounterArgs volume.MounterArgs) error 
 	if err := os.MkdirAll(parentDir, 0750); err != nil {
 		return errors.New(log("mounter.SetUpAt failed to create dir %#v:  %v", parentDir, err))
 	}
-	klog.V(4).Info(log("created target path successfully [%s]", parentDir))
+	if klogV := klog.V(4); klogV.Enabled() {
+		klogV.Info(log("created target path successfully [%s]", parentDir))
+	}
 
 	nodePublishSecrets = map[string]string{}
 	if secretRef != nil {
@@ -353,10 +360,14 @@ func (c *csiMountMgr) SetUpAt(dir string, mounterArgs volume.MounterArgs) error 
 			//      cleaned up.
 			return volumetypes.NewUncertainProgressError(fmt.Sprintf("applyFSGroup failed for vol %s: %v", c.volumeID, err))
 		}
-		klog.V(4).Info(log("mounter.SetupAt fsGroup [%d] applied successfully to %s", *mounterArgs.FsGroup, c.volumeID))
+		if klogV := klog.V(4); klogV.Enabled() {
+			klogV.Info(log("mounter.SetupAt fsGroup [%d] applied successfully to %s", *mounterArgs.FsGroup, c.volumeID))
+		}
 	}
 
-	klog.V(4).Info(log("mounter.SetUp successfully requested NodePublish [%s]", dir))
+	if klogV := klog.V(4); klogV.Enabled() {
+		klogV.Info(log("mounter.SetUp successfully requested NodePublish [%s]", dir))
+	}
 	return nil
 }
 
@@ -435,7 +446,9 @@ func (c *csiMountMgr) TearDown() error {
 	return c.TearDownAt(c.GetPath())
 }
 func (c *csiMountMgr) TearDownAt(dir string) error {
-	klog.V(4).Info(log("Unmounter.TearDownAt(%s)", dir))
+	if klogV := klog.V(4); klogV.Enabled() {
+		klogV.Info(log("Unmounter.TearDownAt(%s)", dir))
+	}
 
 	volID := c.volumeID
 	csi, err := c.csiClientGetter.Get()
@@ -466,7 +479,9 @@ func (c *csiMountMgr) TearDownAt(dir string) error {
 	if err := removeMountDir(c.plugin, dir); err != nil {
 		return errors.New(log("Unmounter.TearDownAt failed to clean mount dir [%s]: %v", dir, err))
 	}
-	klog.V(4).Info(log("Unmounter.TearDownAt successfully unmounted dir [%s]", dir))
+	if klogV := klog.V(4); klogV.Enabled() {
+		klogV.Info(log("Unmounter.TearDownAt successfully unmounted dir [%s]", dir))
+	}
 
 	return nil
 }
@@ -581,26 +596,34 @@ func isDirMounted(plug *csiPlugin, dir string) (bool, error) {
 
 // removeMountDir cleans the mount dir when dir is not mounted and removed the volume data file in dir
 func removeMountDir(plug *csiPlugin, mountPath string) error {
-	klog.V(4).Info(log("removing mount path [%s]", mountPath))
+	if klogV := klog.V(4); klogV.Enabled() {
+		klogV.Info(log("removing mount path [%s]", mountPath))
+	}
 
 	mnt, err := isDirMounted(plug, mountPath)
 	if err != nil {
 		return err
 	}
 	if !mnt {
-		klog.V(4).Info(log("dir not mounted, deleting it [%s]", mountPath))
+		if klogV := klog.V(4); klogV.Enabled() {
+			klogV.Info(log("dir not mounted, deleting it [%s]", mountPath))
+		}
 		if err := os.Remove(mountPath); err != nil && !os.IsNotExist(err) {
 			return errors.New(log("failed to remove dir [%s]: %v", mountPath, err))
 		}
 		// remove volume data file as well
 		volPath := filepath.Dir(mountPath)
 		dataFile := filepath.Join(volPath, volDataFileName)
-		klog.V(4).Info(log("also deleting volume info data file [%s]", dataFile))
+		if klogV := klog.V(4); klogV.Enabled() {
+			klogV.Info(log("also deleting volume info data file [%s]", dataFile))
+		}
 		if err := os.Remove(dataFile); err != nil && !os.IsNotExist(err) {
 			return errors.New(log("failed to delete volume data file [%s]: %v", dataFile, err))
 		}
 		// remove volume path
-		klog.V(4).Info(log("deleting volume path [%s]", volPath))
+		if klogV := klog.V(4); klogV.Enabled() {
+			klogV.Info(log("deleting volume path [%s]", volPath))
+		}
 		if err := os.Remove(volPath); err != nil && !os.IsNotExist(err) {
 			return errors.New(log("failed to delete volume path [%s]: %v", volPath, err))
 		}
@@ -610,8 +633,8 @@ func removeMountDir(plug *csiPlugin, mountPath string) error {
 
 // makeVolumeHandle returns csi-<sha256(podUID,volSourceSpecName)>
 func makeVolumeHandle(podUID, volSourceSpecName string) string {
-	result := sha256.Sum256([]byte(fmt.Sprintf("%s%s", podUID, volSourceSpecName)))
-	return fmt.Sprintf("csi-%x", result)
+	result := sha256.Sum256([]byte(podUID + volSourceSpecName))
+	return "csi-" + hex.EncodeToString(result[:])
 }
 
 func mergeMap(first, second map[string]string) map[string]string {

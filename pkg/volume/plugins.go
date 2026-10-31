@@ -637,30 +637,49 @@ func (pm *VolumePluginMgr) initProbedPlugin(probedPlugin VolumePlugin) error {
 // specification.  If no plugins can support or more than one plugin can
 // support it, return error.
 func (pm *VolumePluginMgr) FindPluginBySpec(spec *Spec) (VolumePlugin, error) {
-	pm.mutex.Lock()
-	defer pm.mutex.Unlock()
 	if spec == nil {
 		return nil, fmt.Errorf("could not find plugin because volume spec is nil")
 	}
+	pm.mutex.RLock()
+	_, isDummy := pm.prober.(*dummyPluginProber)
+	if !isDummy {
+		pm.mutex.RUnlock()
+		pm.mutex.Lock()
+		defer pm.mutex.Unlock()
+	} else {
+		defer pm.mutex.RUnlock()
+	}
 
 	var match VolumePlugin
-	matchedPluginNames := []string{}
+	var matchedPluginNames []string
 	for _, v := range pm.plugins {
 		if v.CanSupport(spec) {
+			if match != nil {
+				if matchedPluginNames == nil {
+					matchedPluginNames = []string{match.GetPluginName()}
+				}
+				matchedPluginNames = append(matchedPluginNames, v.GetPluginName())
+			}
 			match = v
-			matchedPluginNames = append(matchedPluginNames, v.GetPluginName())
 		}
 	}
-	pm.refreshProbedPlugins()
+	if !isDummy {
+		pm.refreshProbedPlugins()
+	}
 
 	for _, plugin := range pm.probedPlugins {
 		if plugin.CanSupport(spec) {
+			if match != nil {
+				if matchedPluginNames == nil {
+					matchedPluginNames = []string{match.GetPluginName()}
+				}
+				matchedPluginNames = append(matchedPluginNames, plugin.GetPluginName())
+			}
 			match = plugin
-			matchedPluginNames = append(matchedPluginNames, plugin.GetPluginName())
 		}
 	}
 
-	if len(matchedPluginNames) == 0 {
+	if match == nil {
 		return nil, ErrNoPluginMatched
 	}
 	if len(matchedPluginNames) > 1 {
@@ -672,14 +691,23 @@ func (pm *VolumePluginMgr) FindPluginBySpec(spec *Spec) (VolumePlugin, error) {
 
 // FindPluginByName fetches a plugin by name. If no plugin is found, returns error.
 func (pm *VolumePluginMgr) FindPluginByName(name string) (VolumePlugin, error) {
-	pm.mutex.Lock()
-	defer pm.mutex.Unlock()
+	pm.mutex.RLock()
+	_, isDummy := pm.prober.(*dummyPluginProber)
+	if !isDummy {
+		pm.mutex.RUnlock()
+		pm.mutex.Lock()
+		defer pm.mutex.Unlock()
+	} else {
+		defer pm.mutex.RUnlock()
+	}
 
 	var match VolumePlugin
 	if v, found := pm.plugins[name]; found {
 		match = v
 	}
-	pm.refreshProbedPlugins()
+	if !isDummy {
+		pm.refreshProbedPlugins()
+	}
 	if plugin, found := pm.probedPlugins[name]; found {
 		if match != nil {
 			return nil, fmt.Errorf("multiple volume plugins matched: %s and %s", match.GetPluginName(), plugin.GetPluginName())

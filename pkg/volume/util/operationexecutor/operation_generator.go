@@ -437,15 +437,19 @@ func (og *operationGenerator) GenerateMountVolumeFunc(
 	isRemount bool) volumetypes.GeneratedOperations {
 
 	volumePluginName := unknownVolumePlugin
-	volumePlugin, err :=
+	outerVolumePlugin, outerPluginErr :=
 		og.volumePluginMgr.FindPluginBySpec(volumeToMount.VolumeSpec)
-	if err == nil && volumePlugin != nil {
-		volumePluginName = volumePlugin.GetPluginName()
+	if outerPluginErr == nil && outerVolumePlugin != nil {
+		volumePluginName = outerVolumePlugin.GetPluginName()
 	}
+	fullPluginName := util.GetFullQualifiedPluginNameForVolume(volumePluginName, volumeToMount.VolumeSpec)
 
 	mountVolumeFunc := func() volumetypes.OperationContext {
 		// Get mounter plugin
-		volumePlugin, err := og.volumePluginMgr.FindPluginBySpec(volumeToMount.VolumeSpec)
+		volumePlugin, err := outerVolumePlugin, outerPluginErr
+		if err != nil || volumePlugin == nil {
+			volumePlugin, err = og.volumePluginMgr.FindPluginBySpec(volumeToMount.VolumeSpec)
+		}
 
 		migrated := getMigratedStatusBySpec(volumeToMount.VolumeSpec)
 
@@ -486,18 +490,19 @@ func (og *operationGenerator) GenerateMountVolumeFunc(
 		}
 
 		// Get attacher, if possible
-		attachableVolumePlugin, _ :=
-			og.volumePluginMgr.FindAttachablePluginBySpec(volumeToMount.VolumeSpec)
 		var volumeAttacher volume.Attacher
-		if attachableVolumePlugin != nil {
-			volumeAttacher, _ = attachableVolumePlugin.NewAttacher()
+		if attachableVolumePlugin, ok := volumePlugin.(volume.AttachableVolumePlugin); ok {
+			if canAttach, err := attachableVolumePlugin.CanAttach(volumeToMount.VolumeSpec); err == nil && canAttach {
+				volumeAttacher, _ = attachableVolumePlugin.NewAttacher()
+			}
 		}
 
 		// get deviceMounter, if possible
-		deviceMountableVolumePlugin, _ := og.volumePluginMgr.FindDeviceMountablePluginBySpec(volumeToMount.VolumeSpec)
 		var volumeDeviceMounter volume.DeviceMounter
-		if deviceMountableVolumePlugin != nil {
-			volumeDeviceMounter, _ = deviceMountableVolumePlugin.NewDeviceMounter()
+		if deviceMountableVolumePlugin, ok := volumePlugin.(volume.DeviceMountableVolumePlugin); ok {
+			if canMount, err := deviceMountableVolumePlugin.CanDeviceMount(volumeToMount.VolumeSpec); err == nil && canMount {
+				volumeDeviceMounter, _ = deviceMountableVolumePlugin.NewDeviceMounter()
+			}
 		}
 
 		var fsGroup *int64
@@ -612,12 +617,14 @@ func (og *operationGenerator) GenerateMountVolumeFunc(
 			return volumetypes.NewOperationContext(eventErr, detailedErr, migrated)
 		}
 
-		detailedMsg := volumeToMount.GenerateMsgDetailed("MountVolume.SetUp succeeded", "")
 		verbosity := klog.Level(1)
 		if isRemount {
 			verbosity = klog.Level(4)
 		}
-		klog.V(verbosity).InfoS(detailedMsg, "pod", klog.KObj(volumeToMount.Pod))
+		if klogV := klog.V(verbosity); klogV.Enabled() {
+			detailedMsg := volumeToMount.GenerateMsgDetailed("MountVolume.SetUp succeeded", "")
+			klogV.InfoS(detailedMsg, "pod", klog.KObj(volumeToMount.Pod))
+		}
 		resizeOptions.DeviceMountPath = volumeMounter.GetPath()
 
 		_, resizeError = og.expandVolumeDuringMount(volumeToMount, actualStateOfWorld, resizeOptions)
@@ -639,7 +646,11 @@ func (og *operationGenerator) GenerateMountVolumeFunc(
 		// plugin call to succeed
 		mountRequestTime := volumeToMount.MountRequestTime
 		totalTimeTaken := time.Since(mountRequestTime).Seconds()
-		util.RecordOperationLatencyMetric(util.GetFullQualifiedPluginNameForVolume(volumePluginName, volumeToMount.VolumeSpec), "overall_volume_mount", totalTimeTaken)
+		metricPluginName := fullPluginName
+		if volumePluginName == unknownVolumePlugin {
+			metricPluginName = util.GetFullQualifiedPluginNameForVolume(volumePlugin.GetPluginName(), volumeToMount.VolumeSpec)
+		}
+		util.RecordOperationLatencyMetric(metricPluginName, "overall_volume_mount", totalTimeTaken)
 
 		markVolMountedErr := actualStateOfWorld.MarkVolumeAsMounted(markOpts)
 		if markVolMountedErr != nil {
@@ -660,7 +671,7 @@ func (og *operationGenerator) GenerateMountVolumeFunc(
 		OperationName:     "volume_mount",
 		OperationFunc:     mountVolumeFunc,
 		EventRecorderFunc: eventRecorderFunc,
-		CompleteFunc:      util.OperationCompleteHook(util.GetFullQualifiedPluginNameForVolume(volumePluginName, volumeToMount.VolumeSpec), "volume_mount"),
+		CompleteFunc:      util.OperationCompleteHook(fullPluginName, "volume_mount"),
 	}
 }
 
@@ -2015,8 +2026,10 @@ func (og *operationGenerator) expandVolumeDuringMount(volumeToMount VolumeToMoun
 }
 
 func (og *operationGenerator) checkIfSupportsNodeExpansion(volumeToMount VolumeToMount) (bool, volume.NodeExpandableVolumePlugin) {
-	if volumeToMount.VolumeSpec != nil &&
-		volumeToMount.VolumeSpec.InlineVolumeSpecForCSIMigration {
+	if volumeToMount.VolumeSpec == nil || volumeToMount.VolumeSpec.PersistentVolume == nil {
+		return false, nil
+	}
+	if volumeToMount.VolumeSpec.InlineVolumeSpecForCSIMigration {
 		klog.V(4).Infof("This volume %s is a migrated inline volume and is not resizable", volumeToMount.VolumeName)
 		return false, nil
 	}
@@ -2025,8 +2038,7 @@ func (og *operationGenerator) checkIfSupportsNodeExpansion(volumeToMount VolumeT
 	expandableVolumePlugin, _ :=
 		og.volumePluginMgr.FindNodeExpandablePluginBySpec(volumeToMount.VolumeSpec)
 	if expandableVolumePlugin != nil &&
-		expandableVolumePlugin.RequiresFSResize() &&
-		volumeToMount.VolumeSpec.PersistentVolume != nil {
+		expandableVolumePlugin.RequiresFSResize() {
 		return true, expandableVolumePlugin
 	}
 	return false, nil

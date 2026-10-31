@@ -341,7 +341,42 @@ func (vm *volumeManager) Run(ctx context.Context, sourcesReady config.SourcesRea
 	logger.Info("Shutting down Kubelet Volume Manager")
 }
 
+type dswPodQueryFastPath interface {
+	CountPodOuterVolumes(podName types.UniquePodName) int
+	ForEachPodOuterVolume(podName types.UniquePodName, fn func(outerVolumeSpecName string, volumeName v1.UniqueVolumeName))
+	AppendAttachableVolumesInUse(dst []v1.UniqueVolumeName) []v1.UniqueVolumeName
+	CountAttachableVolumes() int
+	GetPodVolumesNotInDSW(podName types.UniquePodName, expectedVolumes []string) []string
+	GetPodUnattachedVolumes(podName types.UniquePodName, asw cache.ActualStateOfWorld) []cache.VolumeToMount
+}
+
+type aswPodQueryFastPath interface {
+	PodHasPossiblyMountedVolumes(podName types.UniquePodName) bool
+	ForEachMountedVolumeGIDForPod(podName types.UniquePodName, fn func(volumeGIDValue string))
+	AppendAttachableVolumes(dst []v1.UniqueVolumeName) []v1.UniqueVolumeName
+	CountAttachableVolumes() int
+}
+
 func (vm *volumeManager) GetMountedVolumesForPod(podName types.UniquePodName) container.VolumeMap {
+	if dswFast, ok := vm.desiredStateOfWorld.(dswPodQueryFastPath); ok {
+		count := dswFast.CountPodOuterVolumes(podName)
+		podVolumes := make(container.VolumeMap, count)
+		if count == 0 {
+			return podVolumes
+		}
+		dswFast.ForEachPodOuterVolume(podName, func(outerName string, volumeName v1.UniqueVolumeName) {
+			if mountedVolume, found := vm.actualStateOfWorld.GetMountedVolumeForPod(podName, volumeName); found {
+				podVolumes[outerName] = container.VolumeInfo{
+					Mounter:             mountedVolume.Mounter,
+					BlockVolumeMapper:   mountedVolume.BlockVolumeMapper,
+					ReadOnly:            mountedVolume.VolumeSpec.ReadOnly,
+					InnerVolumeSpecName: mountedVolume.InnerVolumeSpecName,
+				}
+			}
+		})
+		return podVolumes
+	}
+
 	podVolumes := make(container.VolumeMap)
 	for name, mountedVolume := range vm.getMountedVolumes(podName) {
 		podVolumes[name] = container.VolumeInfo{
@@ -355,11 +390,28 @@ func (vm *volumeManager) GetMountedVolumesForPod(podName types.UniquePodName) co
 }
 
 func (vm *volumeManager) HasPossiblyMountedVolumesForPod(podName types.UniquePodName) bool {
+	if aswFast, ok := vm.actualStateOfWorld.(aswPodQueryFastPath); ok {
+		return aswFast.PodHasPossiblyMountedVolumes(podName)
+	}
 	return len(vm.actualStateOfWorld.GetPossiblyMountedVolumesForPod(podName)) > 0
 }
 
 func (vm *volumeManager) GetExtraSupplementalGroupsForPod(pod *v1.Pod) []int64 {
 	podName := util.GetUniquePodName(pod)
+	if aswFast, ok := vm.actualStateOfWorld.(aswPodQueryFastPath); ok {
+		result := make([]int64, 0)
+		aswFast.ForEachMountedVolumeGIDForPod(podName, func(group string) {
+			iGroup, extra := getExtraSupplementalGID(group, pod)
+			if !extra {
+				return
+			}
+			if !slices.Contains(result, iGroup) {
+				result = append(result, iGroup)
+			}
+		})
+		return result
+	}
+
 	supplementalGroups := sets.New[string]()
 
 	for _, mountedVolume := range vm.actualStateOfWorld.GetMountedVolumesForPod(podName) {
@@ -385,6 +437,17 @@ func (vm *volumeManager) GetVolumesInUse() []v1.UniqueVolumeName {
 	// Report volumes in desired state of world and actual state of world so
 	// that volumes are marked in use as soon as the decision is made that the
 	// volume *should* be attached to this node until it is safely unmounted.
+	dswFast, dswOk := vm.desiredStateOfWorld.(dswPodQueryFastPath)
+	aswFast, aswOk := vm.actualStateOfWorld.(aswPodQueryFastPath)
+	if dswOk && aswOk {
+		capHint := dswFast.CountAttachableVolumes() + aswFast.CountAttachableVolumes()
+		volumesToReportInUse := make([]v1.UniqueVolumeName, 0, capHint)
+		volumesToReportInUse = dswFast.AppendAttachableVolumesInUse(volumesToReportInUse)
+		volumesToReportInUse = aswFast.AppendAttachableVolumes(volumesToReportInUse)
+		slices.Sort(volumesToReportInUse)
+		return slices.Compact(volumesToReportInUse)
+	}
+
 	desiredVolumes := vm.desiredStateOfWorld.GetVolumesToMount()
 	allAttachedVolumes := vm.actualStateOfWorld.GetAttachedVolumes()
 	volumesToReportInUse := make([]v1.UniqueVolumeName, 0, len(desiredVolumes)+len(allAttachedVolumes))
@@ -550,6 +613,10 @@ func (vm *volumeManager) WaitForAllPodsUnmount(ctx context.Context, pods []*v1.P
 }
 
 func (vm *volumeManager) getVolumesNotInDSW(uniquePodName types.UniquePodName, expectedVolumes []string) []string {
+	if dswFast, ok := vm.desiredStateOfWorld.(dswPodQueryFastPath); ok {
+		return dswFast.GetPodVolumesNotInDSW(uniquePodName, expectedVolumes)
+	}
+
 	volumesNotInDSW := sets.New(expectedVolumes...)
 
 	for _, volumeToMount := range vm.desiredStateOfWorld.GetVolumesToMount() {
@@ -564,6 +631,10 @@ func (vm *volumeManager) getVolumesNotInDSW(uniquePodName types.UniquePodName, e
 // getUnattachedVolumes returns a list of the volumes that are expected to be attached but
 // are not currently attached to the node
 func (vm *volumeManager) getUnattachedVolumes(uniquePodName types.UniquePodName) []cache.VolumeToMount {
+	if dswFast, ok := vm.desiredStateOfWorld.(dswPodQueryFastPath); ok {
+		return dswFast.GetPodUnattachedVolumes(uniquePodName, vm.actualStateOfWorld)
+	}
+
 	unattachedVolumes := []cache.VolumeToMount{}
 	for _, volumeToMount := range vm.desiredStateOfWorld.GetVolumesToMount() {
 		if volumeToMount.PodName == uniquePodName &&

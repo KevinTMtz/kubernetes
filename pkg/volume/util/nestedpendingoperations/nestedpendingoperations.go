@@ -118,7 +118,7 @@ type NestedPendingOperations interface {
 // NewNestedPendingOperations returns a new instance of NestedPendingOperations.
 func NewNestedPendingOperations(exponentialBackOffOnError bool) NestedPendingOperations {
 	g := &nestedPendingOperations{
-		operations:                []operation{},
+		operations:                make([]operation, 0, 64),
 		exponentialBackOffOnError: exponentialBackOffOnError,
 	}
 	g.cond = sync.NewCond(&g.lock)
@@ -158,11 +158,11 @@ func (grm *nestedPendingOperations) Run(
 			return NewAlreadyExistsError(opKey)
 		}
 
-		backOffErr := previousOp.expBackoff.SafeToRetry(fmt.Sprintf("%+v", opKey))
-		if backOffErr != nil {
-			if previousOp.operationName == generatedOperations.OperationName {
+		if previousOp.operationName == generatedOperations.OperationName {
+			if backOffErr := previousOp.expBackoff.SafeToRetry(fmt.Sprintf("%+v", opKey)); backOffErr != nil {
 				return backOffErr
 			}
+		} else if backOffErr := previousOp.expBackoff.SafeToRetry(""); backOffErr != nil {
 			// previous operation and new operation are different. reset op. name and exp. backoff
 			grm.operations[previousOpIndex].operationName = generatedOperations.OperationName
 			grm.operations[previousOpIndex].expBackoff = exponentialbackoff.ExponentialBackoff{}
@@ -210,9 +210,8 @@ func (grm *nestedPendingOperations) IsOperationSafeToRetry(
 	if previousOp.operationPending {
 		return false
 	}
-	backOffErr := previousOp.expBackoff.SafeToRetry(fmt.Sprintf("%+v", opKey))
-	if backOffErr != nil {
-		if previousOp.operationName == operationName {
+	if previousOp.operationName == operationName {
+		if backOffErr := previousOp.expBackoff.SafeToRetry(fmt.Sprintf("%+v", opKey)); backOffErr != nil {
 			return false
 		}
 	}

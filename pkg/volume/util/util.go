@@ -255,7 +255,7 @@ func GetUniquePodName(pod *v1.Pod) types.UniquePodName {
 // to prevent operations (attach/detach or mount/unmount) from being triggered
 // on the same volume.
 func GetUniqueVolumeName(pluginName, volumeName string) v1.UniqueVolumeName {
-	return v1.UniqueVolumeName(fmt.Sprintf("%s/%s", pluginName, volumeName))
+	return v1.UniqueVolumeName(pluginName + "/" + volumeName)
 }
 
 // GetUniqueVolumeNameFromSpecWithPod returns a unique volume name with pod
@@ -263,8 +263,7 @@ func GetUniqueVolumeName(pluginName, volumeName string) v1.UniqueVolumeName {
 // on same volume.
 func GetUniqueVolumeNameFromSpecWithPod(
 	podName types.UniquePodName, volumePlugin volume.VolumePlugin, volumeSpec *volume.Spec) v1.UniqueVolumeName {
-	return v1.UniqueVolumeName(
-		fmt.Sprintf("%s/%v-%s", volumePlugin.GetPluginName(), podName, volumeSpec.Name()))
+	return v1.UniqueVolumeName(volumePlugin.GetPluginName() + "/" + string(podName) + "-" + volumeSpec.Name())
 }
 
 // GetUniqueVolumeNameFromSpec uses the given VolumePlugin to generate a unique
@@ -321,12 +320,17 @@ func notRunning(statuses []v1.ContainerStatus) bool {
 // description and pkg/volume/util/volumehelper/volumehelper.go GetUniqueVolumeNameFromSpec that constructs
 // the unique volume names.
 func SplitUniqueName(uniqueName v1.UniqueVolumeName) (string, string, error) {
-	components := strings.SplitN(string(uniqueName), "/", 3)
-	if len(components) != 3 {
+	s := string(uniqueName)
+	first := strings.IndexByte(s, '/')
+	if first < 0 {
 		return "", "", fmt.Errorf("cannot split volume unique name %s to plugin/volume components", uniqueName)
 	}
-	pluginName := fmt.Sprintf("%s/%s", components[0], components[1])
-	return pluginName, components[2], nil
+	secondRel := strings.IndexByte(s[first+1:], '/')
+	if secondRel < 0 {
+		return "", "", fmt.Errorf("cannot split volume unique name %s to plugin/volume components", uniqueName)
+	}
+	second := first + 1 + secondRel
+	return s[:second], s[second+1:], nil
 }
 
 // GetVolumeMode retrieves VolumeMode from pv.
@@ -501,9 +505,11 @@ func IsLocalEphemeralVolume(volume v1.Volume) bool {
 // either as filesystem mount or raw block device.
 // To save another sweep through containers, SELinux options are optionally collected too.
 func GetPodVolumeNames(pod *v1.Pod, collectSELinuxOptions bool) (mounts sets.Set[string], devices sets.Set[string], seLinuxContainerContexts map[string][]*v1.SELinuxOptions) {
-	mounts = sets.New[string]()
+	mounts = make(sets.Set[string], len(pod.Spec.Volumes))
 	devices = sets.New[string]()
-	seLinuxContainerContexts = make(map[string][]*v1.SELinuxOptions)
+	if collectSELinuxOptions {
+		seLinuxContainerContexts = make(map[string][]*v1.SELinuxOptions)
+	}
 
 	podutil.VisitContainers(&pod.Spec, podutil.AllFeatureEnabledContainers(), func(container *v1.Container, containerType podutil.ContainerType) bool {
 		var seLinuxOptions *v1.SELinuxOptions
@@ -514,18 +520,15 @@ func GetPodVolumeNames(pod *v1.Pod, collectSELinuxOptions bool) (mounts sets.Set
 			}
 		}
 
-		if container.VolumeMounts != nil {
-			for _, mount := range container.VolumeMounts {
-				mounts.Insert(mount.Name)
-				if seLinuxOptions != nil && collectSELinuxOptions {
-					seLinuxContainerContexts[mount.Name] = append(seLinuxContainerContexts[mount.Name], seLinuxOptions.DeepCopy())
-				}
+		for i := range container.VolumeMounts {
+			mountName := container.VolumeMounts[i].Name
+			mounts.Insert(mountName)
+			if seLinuxOptions != nil && collectSELinuxOptions {
+				seLinuxContainerContexts[mountName] = append(seLinuxContainerContexts[mountName], seLinuxOptions.DeepCopy())
 			}
 		}
-		if container.VolumeDevices != nil {
-			for _, device := range container.VolumeDevices {
-				devices.Insert(device.Name)
-			}
+		for i := range container.VolumeDevices {
+			devices.Insert(container.VolumeDevices[i].Name)
 		}
 		return true
 	})

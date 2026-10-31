@@ -58,7 +58,9 @@ func getCredentialsFromSecret(k8s kubernetes.Interface, secretRef *api.SecretRef
 // saveVolumeData persists parameter data as json file at the provided location
 func saveVolumeData(dir string, fileName string, data map[string]string) error {
 	dataFilePath := filepath.Join(dir, fileName)
-	klog.V(4).Info(log("saving volume data file [%s]", dataFilePath))
+	if klogV := klog.V(4); klogV.Enabled() {
+		klogV.Info(log("saving volume data file [%s]", dataFilePath))
+	}
 	file, err := os.Create(dataFilePath)
 	if err != nil {
 		return errors.New(log("failed to save volume data file %s: %v", dataFilePath, err))
@@ -67,7 +69,9 @@ func saveVolumeData(dir string, fileName string, data map[string]string) error {
 	if err := json.NewEncoder(file).Encode(data); err != nil {
 		return errors.New(log("failed to save volume data file %s: %v", dataFilePath, err))
 	}
-	klog.V(4).Info(log("volume data file saved successfully [%s]", dataFilePath))
+	if klogV := klog.V(4); klogV.Enabled() {
+		klogV.Info(log("volume data file saved successfully [%s]", dataFilePath))
+	}
 	return nil
 }
 
@@ -75,7 +79,9 @@ func saveVolumeData(dir string, fileName string, data map[string]string) error {
 func loadVolumeData(dir string, fileName string) (map[string]string, error) {
 	// remove /mount at the end
 	dataFileName := filepath.Join(dir, fileName)
-	klog.V(4).Info(log("loading volume data file [%s]", dataFileName))
+	if klogV := klog.V(4); klogV.Enabled() {
+		klogV.Info(log("loading volume data file [%s]", dataFileName))
+	}
 
 	file, err := os.Open(dataFileName)
 	if err != nil {
@@ -105,7 +111,10 @@ func getReadOnlyFromSpec(spec *volume.Spec) (bool, error) {
 
 // log prepends log string with `kubernetes.io/csi`
 func log(msg string, parts ...interface{}) string {
-	return fmt.Sprintf(fmt.Sprintf("%s: %s", CSIPluginName, msg), parts...)
+	if len(parts) == 0 {
+		return CSIPluginName + ": " + msg
+	}
+	return fmt.Sprintf(CSIPluginName+": "+msg, parts...)
 }
 
 // getVolumePluginDir returns the path where CSI plugin keeps metadata for given volume
