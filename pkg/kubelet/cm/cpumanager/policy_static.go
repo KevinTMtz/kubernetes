@@ -291,7 +291,17 @@ func (p *staticPolicy) GetAllocatableCPUs(_ state.State) cpuset.CPUSet {
 
 // GetAvailableCPUs returns the set of unassigned CPUs minus the reserved set.
 func (p *staticPolicy) GetAvailableCPUs(s state.State) cpuset.CPUSet {
-	return s.GetDefaultCPUSet().Difference(p.reservedCPUs)
+	return getDefaultCPUSetView(s).Difference(p.reservedCPUs)
+}
+
+func firstContainerName(pod *v1.Pod) string {
+	if len(pod.Spec.InitContainers) > 0 {
+		return pod.Spec.InitContainers[0].Name
+	}
+	if len(pod.Spec.Containers) > 0 {
+		return pod.Spec.Containers[0].Name
+	}
+	return ""
 }
 
 func (p *staticPolicy) updateCPUsToReuse(pod *v1.Pod, container *v1.Container, cset cpuset.CPUSet) {
@@ -307,9 +317,10 @@ func (p *staticPolicy) updateCPUsToReuse(pod *v1.Pod, container *v1.Container, c
 	}
 	// Check if the container is an init container.
 	// If so, add its cpuset to the cpuset of reusable CPUs for any new allocations.
-	for _, initContainer := range pod.Spec.InitContainers {
+	for i := range pod.Spec.InitContainers {
+		initContainer := &pod.Spec.InitContainers[i]
 		if container.Name == initContainer.Name {
-			if podutil.IsRestartableInitContainer(&initContainer) {
+			if podutil.IsRestartableInitContainer(initContainer) {
 				// If the container is a restartable init container, we should not
 				// reuse its cpuset, as a restartable init container can run with
 				// regular containers.
@@ -321,7 +332,9 @@ func (p *staticPolicy) updateCPUsToReuse(pod *v1.Pod, container *v1.Container, c
 	}
 	// Otherwise it is an app container.
 	// Remove its cpuset from the cpuset of reusable CPUs for any new allocations.
-	p.cpusToReuse[string(pod.UID)] = p.cpusToReuse[string(pod.UID)].Difference(cset)
+	if existing := p.cpusToReuse[string(pod.UID)]; !existing.IsEmpty() {
+		p.cpusToReuse[string(pod.UID)] = existing.Difference(cset)
+	}
 }
 
 // validatePodScopeResources checks for the "empty shared pool" scenario. This occurs
@@ -340,10 +353,11 @@ func (p *staticPolicy) validatePodScopeResources(logger klog.Logger, pod *v1.Pod
 	sumOfLongRunningExclusiveCPUs := 0
 
 	// Check for empty shared pool for standard init containers.
-	for _, container := range pod.Spec.InitContainers {
-		guaranteedCPUs := p.guaranteedCPUs(logger, pod, &container)
+	for i := range pod.Spec.InitContainers {
+		container := &pod.Spec.InitContainers[i]
+		guaranteedCPUs := p.guaranteedCPUs(logger, pod, container)
 
-		if !podutil.IsRestartableInitContainer(&container) {
+		if !podutil.IsRestartableInitContainer(container) {
 			if guaranteedCPUs == 0 && sumOfLongRunningExclusiveCPUs >= podTotalCPUs {
 				// This check ensures that if there are any standard init containers that need a
 				// shared pool, that pool is not empty. An empty pool would occur if the pod
@@ -361,8 +375,9 @@ func (p *staticPolicy) validatePodScopeResources(logger klog.Logger, pod *v1.Pod
 	}
 
 	// Check for empty shared pool for concurrently running containers (app and restartable init containers).
-	for _, container := range pod.Spec.Containers {
-		guaranteedCPUs := p.guaranteedCPUs(logger, pod, &container)
+	for i := range pod.Spec.Containers {
+		container := &pod.Spec.Containers[i]
+		guaranteedCPUs := p.guaranteedCPUs(logger, pod, container)
 
 		if guaranteedCPUs == 0 {
 			hasSharedLongRunningContainers = true
@@ -386,7 +401,9 @@ func (p *staticPolicy) validatePodScopeResources(logger klog.Logger, pod *v1.Pod
 // The logic here allocates a single "bubble" of CPUs for the entire pod
 // and then partitions that bubble among the containers.
 func (p *staticPolicy) AllocatePod(logger klog.Logger, s state.State, pod *v1.Pod, operation lifecycle.Operation) (rerr error) {
-	logger = klog.LoggerWithValues(logger, "pod", klog.KObj(pod), "podUID", pod.UID, "operation", operation)
+	if logger.Enabled() {
+		logger = klog.LoggerWithValues(logger, "pod", klog.KObj(pod), "podUID", pod.UID, "operation", operation)
+	}
 	logger.V(4).Info("AllocatePod called for pod-level managed pod")
 
 	// Static policy supports only Add pod-level resource allocation operation.
@@ -420,7 +437,7 @@ func (p *staticPolicy) allocatePodForAdd(logger klog.Logger, s state.State, pod 
 	// allocations are preserved even if they violate the current policy: after
 	// a kubelet restart the pod must keep the exact same CPUs it had before.
 	// This mirrors the container-scope behavior (see allocateForAdd).
-	if podCPUSet, ok := s.GetPodCPUSet(podUID); ok && !podCPUSet.IsEmpty() {
+	if podCPUSet, ok := getPodCPUSetView(s, podUID); ok && !podCPUSet.IsEmpty() {
 		switch podAllocationStaleness(s, pod, podCPUSet) {
 		case notStale:
 			logger.V(4).Info("Static policy: pod-level CPU set already present in state, restoring", "podCPUSet", podCPUSet)
@@ -433,8 +450,11 @@ func (p *staticPolicy) allocatePodForAdd(logger klog.Logger, s state.State, pod 
 			// set but before the pod-level entry was dropped. Restoring the
 			// entry would hand out CPUs which are also in the shared pool, so
 			// complete the release instead and allocate from scratch.
-			logger.V(4).Info("Static policy: dropping the stale pod-level CPU set overlapping the default CPU set",
-				"podCPUSet", podCPUSet, "defaultCPUSet", s.GetDefaultCPUSet(), "overlap", podCPUSet.Intersection(s.GetDefaultCPUSet()))
+			if logger.V(4).Enabled() {
+				defaultCPUSet := getDefaultCPUSetView(s)
+				logger.V(4).Info("Static policy: dropping the stale pod-level CPU set overlapping the default CPU set",
+					"podCPUSet", podCPUSet, "defaultCPUSet", defaultCPUSet, "overlap", podCPUSet.Intersection(defaultCPUSet))
+			}
 			s.DeletePod(podUID)
 			p.updateMetricsFromState(logger, s)
 		case staleNonPrefix:
@@ -477,7 +497,7 @@ func (p *staticPolicy) allocatePodForAdd(logger klog.Logger, s state.State, pod 
 	}
 
 	// 4. Allocate the entire CPU "bubble" for the pod using the hint from the Topology Manager.
-	hint := p.affinity.GetAffinity(logger, podUID, append(pod.Spec.InitContainers, pod.Spec.Containers...)[0].Name)
+	hint := p.affinity.GetAffinity(logger, podUID, firstContainerName(pod))
 	numaHintCount := 0
 	if hint.NUMANodeAffinity != nil {
 		numaHintCount = hint.NUMANodeAffinity.Count()
@@ -512,7 +532,9 @@ func (p *staticPolicy) allocatePodForAdd(logger klog.Logger, s state.State, pod 
 	if err != nil {
 		return err
 	}
-	logger.V(4).Info("Partitioned pod-level CPU allocation", "exclusiveCPUs", podCPUAllocationToString(result.exclusiveCPUs), "podSharedPool", result.podSharedPool)
+	if logger.V(4).Enabled() {
+		logger.V(4).Info("Partitioned pod-level CPU allocation", "exclusiveCPUs", podCPUAllocationToString(result.exclusiveCPUs), "podSharedPool", result.podSharedPool)
+	}
 
 	// 6. Save all container assignments to the state.
 	p.savePodContainerAssignments(s, podUID, pod, result, nil)
@@ -547,7 +569,7 @@ type podPartitionResult struct {
 // If restored is nil (allocatePodForAdd path), every container's assignment
 // is freshly allocated.
 func (p *staticPolicy) partitionPodCPUs(logger klog.Logger, pod *v1.Pod, podCPUSet cpuset.CPUSet, restored map[string]cpuset.CPUSet, numaHintCount int) (*podPartitionResult, error) {
-	exclusiveCPUs := make(map[string]cpuset.CPUSet)
+	exclusiveCPUs := make(map[string]cpuset.CPUSet, len(pod.Spec.InitContainers)+len(pod.Spec.Containers))
 	sidecarCPUs := cpuset.New()
 	missing := 0
 
@@ -555,8 +577,9 @@ func (p *staticPolicy) partitionPodCPUs(logger klog.Logger, pod *v1.Pod, podCPUS
 	isRestore := restored != nil
 
 	// First, iterate through all init containers and allocate their CPUs from the initial pod bubble.
-	for _, c := range pod.Spec.InitContainers {
-		if numCPUs := p.guaranteedCPUs(logger, pod, &c); numCPUs > 0 {
+	for i := range pod.Spec.InitContainers {
+		c := &pod.Spec.InitContainers[i]
+		if numCPUs := p.guaranteedCPUs(logger, pod, c); numCPUs > 0 {
 			metrics.CPUManagerPinningRequestsTotal.Inc()
 			cset, ok := restored[c.Name]
 			if !ok {
@@ -582,7 +605,7 @@ func (p *staticPolicy) partitionPodCPUs(logger klog.Logger, pod *v1.Pod, podCPUS
 			exclusiveCPUs[c.Name] = cset
 
 			// If it's a restartable sidecar, its CPUs are permanently consumed.
-			if podutil.IsRestartableInitContainer(&c) {
+			if podutil.IsRestartableInitContainer(c) {
 				sidecarCPUs = sidecarCPUs.Union(cset)
 			}
 			continue
@@ -590,7 +613,7 @@ func (p *staticPolicy) partitionPodCPUs(logger klog.Logger, pod *v1.Pod, podCPUS
 
 		// Restartable init containers without exclusive CPUs use the pod shared
 		// pool, assigned in the final loop in savePodContainerAssignments.
-		if podutil.IsRestartableInitContainer(&c) {
+		if podutil.IsRestartableInitContainer(c) {
 			if _, ok := restored[c.Name]; !ok {
 				missing++
 			}
@@ -617,8 +640,9 @@ func (p *staticPolicy) partitionPodCPUs(logger klog.Logger, pod *v1.Pod, podCPUS
 	podSharedPool := podCPUSet.Difference(sidecarCPUs)
 
 	// Second, iterate through regular containers, allocating from the remaining pool.
-	for _, c := range pod.Spec.Containers {
-		numCPUs := p.guaranteedCPUs(logger, pod, &c)
+	for i := range pod.Spec.Containers {
+		c := &pod.Spec.Containers[i]
+		numCPUs := p.guaranteedCPUs(logger, pod, c)
 		if numCPUs == 0 {
 			// Shared pod pool consumer, assigned in the final loop in savePodContainerAssignments.
 			if _, ok := restored[c.Name]; !ok {
@@ -661,18 +685,25 @@ func (p *staticPolicy) partitionPodCPUs(logger klog.Logger, pod *v1.Pod, podCPUS
 // freshly allocated ones). If restored is nil (allocatePodForAdd path),
 // metrics are incremented for every container.
 func (p *staticPolicy) savePodContainerAssignments(s state.State, podUID string, pod *v1.Pod, result *podPartitionResult, restored map[string]cpuset.CPUSet) {
-	for _, c := range append(pod.Spec.InitContainers, pod.Spec.Containers...) {
-		if cset, isExclusive := result.exclusiveCPUs[c.Name]; isExclusive {
-			s.SetCPUSet(podUID, c.Name, cset)
-		} else {
-			s.SetCPUSet(podUID, c.Name, result.podSharedPool)
-			if _, ok := restored[c.Name]; !ok {
-				metrics.ResourceManagerContainerAssignments.WithLabelValues(metrics.ResourceManagerCPU, metrics.ResourceManagerSharedPod).Inc()
-			}
+	for pass := 0; pass < 2; pass++ {
+		containers := pod.Spec.InitContainers
+		if pass == 1 {
+			containers = pod.Spec.Containers
 		}
+		for i := range containers {
+			cName := containers[i].Name
+			if cset, isExclusive := result.exclusiveCPUs[cName]; isExclusive {
+				s.SetCPUSet(podUID, cName, cset)
+			} else {
+				s.SetCPUSet(podUID, cName, result.podSharedPool)
+				if _, ok := restored[cName]; !ok {
+					metrics.ResourceManagerContainerAssignments.WithLabelValues(metrics.ResourceManagerCPU, metrics.ResourceManagerSharedPod).Inc()
+				}
+			}
 
-		if _, ok := restored[c.Name]; !ok {
-			metrics.ResourceManagerAllocationsTotal.WithLabelValues(metrics.ResourceManagerCPU, metrics.ResourceManagerPod).Inc()
+			if _, ok := restored[cName]; !ok {
+				metrics.ResourceManagerAllocationsTotal.WithLabelValues(metrics.ResourceManagerCPU, metrics.ResourceManagerPod).Inc()
+			}
 		}
 	}
 }
@@ -714,7 +745,7 @@ func (p *staticPolicy) restorePodAllocation(logger klog.Logger, s state.State, p
 	}()
 
 	// Acquire hints for whole pod - same as during regular pod allocation.
-	hint := p.affinity.GetAffinity(logger, podUID, append(pod.Spec.InitContainers, pod.Spec.Containers...)[0].Name)
+	hint := p.affinity.GetAffinity(logger, podUID, firstContainerName(pod))
 	numaHintCount := 0
 	if hint.NUMANodeAffinity != nil {
 		numaHintCount = hint.NUMANodeAffinity.Count()
@@ -732,7 +763,9 @@ func (p *staticPolicy) restorePodAllocation(logger klog.Logger, s state.State, p
 		return nil
 	}
 
-	logger.V(4).Info("Completed partially restored pod-level CPU allocation", "exclusiveCPUs", podCPUAllocationToString(result.exclusiveCPUs), "podSharedPool", result.podSharedPool)
+	if logger.V(4).Enabled() {
+		logger.V(4).Info("Completed partially restored pod-level CPU allocation", "exclusiveCPUs", podCPUAllocationToString(result.exclusiveCPUs), "podSharedPool", result.podSharedPool)
+	}
 
 	// Save the assignments of all containers to the state. Restored assignments
 	// are written back unchanged; containers without exclusive CPUs get the
@@ -767,13 +800,46 @@ const (
 // later classify as stale, or the Topology Manager could reject the pod
 // before the cleanup runs).
 func podAllocationStaleness(s state.State, pod *v1.Pod, podCPUSet cpuset.CPUSet) staleKind {
-	if overlap := podCPUSet.Intersection(s.GetDefaultCPUSet()); !overlap.IsEmpty() {
+	if overlap := podCPUSet.Intersection(getDefaultCPUSetView(s)); !overlap.IsEmpty() {
 		return staleOverlap
+	}
+	if fr, ok := s.(state.FastReader); ok {
+		if !podAssignmentsFormSpecPrefix(fr, pod) {
+			return staleNonPrefix
+		}
+		return notStale
 	}
 	if !assignmentsFormSpecPrefix(pod, s.GetCPUAssignments()[string(pod.UID)]) {
 		return staleNonPrefix
 	}
 	return notStale
+}
+
+func podAssignmentsFormSpecPrefix(fr state.FastReader, pod *v1.Pod) bool {
+	podUID := string(pod.UID)
+	total := fr.GetPodCPUAssignmentCount(podUID)
+	if total == 0 {
+		return true
+	}
+	matched := 0
+	missingSeen := false
+	for pass := 0; pass < 2; pass++ {
+		containers := pod.Spec.InitContainers
+		if pass == 1 {
+			containers = pod.Spec.Containers
+		}
+		for i := range containers {
+			if _, ok := fr.GetCPUSetView(podUID, containers[i].Name); !ok {
+				missingSeen = true
+				continue
+			}
+			if missingSeen {
+				return false
+			}
+			matched++
+		}
+	}
+	return matched == total
 }
 
 // assignmentsFormSpecPrefix reports whether the container assignments cover a
@@ -785,15 +851,21 @@ func podAllocationStaleness(s state.State, pod *v1.Pod, podCPUSet cpuset.CPUSet)
 func assignmentsFormSpecPrefix(pod *v1.Pod, assignments map[string]cpuset.CPUSet) bool {
 	matched := 0
 	missingSeen := false
-	for c := range podutil.ContainerIter(&pod.Spec, podutil.InitContainers|podutil.Containers) {
-		if _, ok := assignments[c.Name]; !ok {
-			missingSeen = true
-			continue
+	for pass := 0; pass < 2; pass++ {
+		containers := pod.Spec.InitContainers
+		if pass == 1 {
+			containers = pod.Spec.Containers
 		}
-		if missingSeen {
-			return false
+		for i := range containers {
+			if _, ok := assignments[containers[i].Name]; !ok {
+				missingSeen = true
+				continue
+			}
+			if missingSeen {
+				return false
+			}
+			matched++
 		}
-		matched++
 	}
 	return matched == len(assignments)
 }
@@ -849,7 +921,7 @@ func (p *staticPolicy) enforceSMTAlignment(s state.State, numCPUs int) error {
 		}
 	}
 
-	availablePhysicalCPUs := s.GetDefaultCPUSet().Difference(p.reservedPhysicalCPUs).Size()
+	availablePhysicalCPUs := getDefaultCPUSetView(s).Difference(p.reservedPhysicalCPUs).Size()
 
 	// It's legal to reserve CPUs which are not core siblings. In this case the CPU allocator can descend to single cores
 	// when picking CPUs. This will void the guarantee of FullPhysicalCPUsOnly. To prevent this, we need to additionally consider
@@ -867,7 +939,9 @@ func (p *staticPolicy) enforceSMTAlignment(s state.State, numCPUs int) error {
 }
 
 func (p *staticPolicy) Allocate(logger klog.Logger, s state.State, pod *v1.Pod, container *v1.Container, operation lifecycle.Operation) (rerr error) {
-	logger = klog.LoggerWithValues(logger, "pod", klog.KObj(pod), "podUID", pod.UID, "containerName", container.Name, "operation", operation)
+	if logger.Enabled() {
+		logger = klog.LoggerWithValues(logger, "pod", klog.KObj(pod), "podUID", pod.UID, "containerName", container.Name, "operation", operation)
+	}
 	logger.Info("Allocate start") // V=0 for backward compatibility
 	defer logger.V(2).Info("Allocate end")
 
@@ -888,7 +962,9 @@ func (p *staticPolicy) allocateForAdd(logger klog.Logger, s state.State, pod *v1
 	}
 
 	if (!utilfeature.DefaultFeatureGate.Enabled(features.PodLevelResourceManagers) || !utilfeature.DefaultFeatureGate.Enabled(features.PodLevelResources)) && resourcehelper.IsPodLevelResourcesSet(pod) {
-		logger.V(2).Info("CPU Manager allocation skipped, pod is using pod-level resources but the PodLevelResourceManagers feature gate is not enabled", "pod", klog.KObj(pod), "podUID", pod.UID)
+		if logger.V(2).Enabled() {
+			logger.V(2).Info("CPU Manager allocation skipped, pod is using pod-level resources but the PodLevelResourceManagers feature gate is not enabled", "pod", klog.KObj(pod), "podUID", pod.UID)
+		}
 		return nil
 	}
 
@@ -915,7 +991,7 @@ func (p *staticPolicy) allocateForAdd(logger klog.Logger, s state.State, pod *v1
 	// For example, if kubelet previously ran with full-pcpus-only=false and is
 	// restarted with full-pcpus-only=true, checkpointed allocations that don't
 	// satisfy SMT alignment are accepted to avoid disrupting running workloads.
-	if cset, ok := s.GetCPUSet(string(pod.UID), container.Name); ok {
+	if cset, ok := getCPUSetView(s, string(pod.UID), container.Name); ok {
 		p.updateCPUsToReuse(pod, container, cset)
 		logger.Info("Static policy: container already present in state, skipping")
 		return nil
@@ -942,12 +1018,17 @@ func (p *staticPolicy) allocateForAdd(logger klog.Logger, s state.State, pod *v1
 	metrics.ResourceManagerAllocationsTotal.WithLabelValues(metrics.ResourceManagerCPU, metrics.ResourceManagerNode).Inc()
 	metrics.ResourceManagerContainerAssignments.WithLabelValues(metrics.ResourceManagerCPU, metrics.ResourceManagerExclusiveNode).Inc()
 
-	logger.V(4).Info("Allocated exclusive CPUs", "cpuset", cpuAllocation.CPUs.String())
+	if logger.V(4).Enabled() {
+		logger.V(4).Info("Allocated exclusive CPUs", "cpuset", cpuAllocation.CPUs.String())
+	}
 	return nil
 }
 
 // getAssignedCPUsOfSiblings returns assigned cpus of given container's siblings(all containers other than the given container) in the given pod `podUID`.
 func getAssignedCPUsOfSiblings(s state.State, podUID string, containerName string) cpuset.CPUSet {
+	if fr, ok := s.(state.FastReader); ok {
+		return fr.GetAssignedCPUsOfSiblings(podUID, containerName)
+	}
 	assignments := s.GetCPUAssignments()
 	cset := cpuset.New()
 	for name, cpus := range assignments[podUID] {
@@ -959,11 +1040,20 @@ func getAssignedCPUsOfSiblings(s state.State, podUID string, containerName strin
 	return cset
 }
 
+func getPodCPUAssignmentCount(s state.State, podUID string) int {
+	if fr, ok := s.(state.FastReader); ok {
+		return fr.GetPodCPUAssignmentCount(podUID)
+	}
+	return len(s.GetCPUAssignments()[podUID])
+}
+
 func (p *staticPolicy) RemoveContainer(logger klog.Logger, s state.State, podUID string, containerName string) error {
-	logger = klog.LoggerWithValues(logger, "podUID", podUID, "containerName", containerName)
+	if logger.Enabled() {
+		logger = klog.LoggerWithValues(logger, "podUID", podUID, "containerName", containerName)
+	}
 	logger.Info("RemoveContainer start") // backward compatibility
 	defer logger.V(4).Info("RemoveContainer start")
-	toRelease, ok := s.GetCPUSet(podUID, containerName)
+	toRelease, ok := getCPUSetView(s, podUID, containerName)
 	if !ok {
 		return nil
 	}
@@ -971,10 +1061,10 @@ func (p *staticPolicy) RemoveContainer(logger klog.Logger, s state.State, podUID
 
 	// Check if this pod is managed with pod-level CPUs.
 	if utilfeature.DefaultFeatureGate.Enabled(features.PodLevelResourceManagers) {
-		if podCPUSet, isPodLevel := s.GetPodCPUSet(podUID); isPodLevel {
+		if podCPUSet, isPodLevel := getPodCPUSetView(s, podUID); isPodLevel {
 			// If this was the last container for the pod, then release the entire pod-level CPU set.
-			if len(s.GetCPUAssignments()[podUID]) == 0 {
-				updatedCPUSets := s.GetDefaultCPUSet().Union(podCPUSet)
+			if getPodCPUAssignmentCount(s, podUID) == 0 {
+				updatedCPUSets := getDefaultCPUSetView(s).Union(podCPUSet)
 				s.SetDefaultCPUSet(updatedCPUSets)
 				s.DeletePod(podUID) // Clean up all state for the pod.
 				p.updateMetricsFromState(logger, s)
@@ -989,7 +1079,7 @@ func (p *staticPolicy) RemoveContainer(logger klog.Logger, s state.State, podUID
 	cpusInUse := getAssignedCPUsOfSiblings(s, podUID, containerName)
 	// Mutate the shared pool, adding released cpus.
 	toRelease = toRelease.Difference(cpusInUse)
-	updatedCPUs := s.GetDefaultCPUSet().Union(toRelease)
+	updatedCPUs := getDefaultCPUSetView(s).Union(toRelease)
 	s.SetDefaultCPUSet(updatedCPUs)
 	p.updateMetricsFromState(logger, s)
 	logger.Info("RemoveContainer end", "defaultCPUSet", updatedCPUs)
@@ -999,7 +1089,10 @@ func (p *staticPolicy) RemoveContainer(logger klog.Logger, s state.State, podUID
 func (p *staticPolicy) allocateCPUs(logger klog.Logger, s state.State, numCPUs int, numaAffinity bitmask.BitMask, reusableCPUs cpuset.CPUSet) (topology.Allocation, error) {
 	logger.Info("AllocateCPUs", "numCPUs", numCPUs, "socket", numaAffinity)
 
-	allocatableCPUs := p.GetAvailableCPUs(s).Union(reusableCPUs)
+	allocatableCPUs := p.GetAvailableCPUs(s)
+	if !reusableCPUs.IsEmpty() {
+		allocatableCPUs = allocatableCPUs.Union(reusableCPUs)
+	}
 
 	// If there are aligned CPUs in numaAffinity, attempt to take those first.
 	result := topology.EmptyAllocation()
@@ -1016,21 +1109,33 @@ func (p *staticPolicy) allocateCPUs(logger klog.Logger, s state.State, numCPUs i
 			return topology.EmptyAllocation(), err
 		}
 
-		result.CPUs = result.CPUs.Union(allocatedCPUs)
+		result.CPUs = allocatedCPUs
 	}
 
 	// Get any remaining CPUs from what's leftover after attempting to grab aligned ones.
-	remainingCPUs, err := p.takeByTopology(logger, allocatableCPUs.Difference(result.CPUs), numCPUs-result.CPUs.Size(), 0)
-	if err != nil {
-		return topology.EmptyAllocation(), err
+	if remainingNeeded := numCPUs - result.CPUs.Size(); remainingNeeded > 0 || numaAffinity == nil {
+		remainingPool := allocatableCPUs
+		if !result.CPUs.IsEmpty() {
+			remainingPool = allocatableCPUs.Difference(result.CPUs)
+		}
+		remainingCPUs, err := p.takeByTopology(logger, remainingPool, remainingNeeded, 0)
+		if err != nil {
+			return topology.EmptyAllocation(), err
+		}
+		if result.CPUs.IsEmpty() {
+			result.CPUs = remainingCPUs
+		} else if !remainingCPUs.IsEmpty() {
+			result.CPUs = result.CPUs.Union(remainingCPUs)
+		}
 	}
-	result.CPUs = result.CPUs.Union(remainingCPUs)
 	result.Aligned = p.topology.CheckAlignment(result.CPUs)
 
 	// Remove allocated CPUs from the shared CPUSet.
-	s.SetDefaultCPUSet(s.GetDefaultCPUSet().Difference(result.CPUs))
+	s.SetDefaultCPUSet(getDefaultCPUSetView(s).Difference(result.CPUs))
 
-	logger.Info("AllocateCPUs", "result", result.String())
+	if logger.Enabled() {
+		logger.Info("AllocateCPUs", "result", result.String())
+	}
 	return result, nil
 }
 
@@ -1051,13 +1156,17 @@ func (p *staticPolicy) guaranteedCPUs(logger klog.Logger, pod *v1.Pod, container
 	// CPUs if its request equals its limit for both the CPU and Memory. This
 	// aligns with the Guaranteed QoS requirement for container-level resources.
 	if utilfeature.DefaultFeatureGate.Enabled(features.PodLevelResourceManagers) && resourcehelper.IsPodLevelResourcesSet(pod) && !cmqos.IsContainerEquivalentQOSGuaranteed(container) {
-		logger.V(5).Info("Exclusive CPU allocation skipped, container is not eligible, request and limit are not equal", "pod", klog.KObj(pod), "containerName", container.Name)
+		if logger.V(5).Enabled() {
+			logger.V(5).Info("Exclusive CPU allocation skipped, container is not eligible, request and limit are not equal", "pod", klog.KObj(pod), "containerName", container.Name)
+		}
 		return 0
 	}
 
 	cpuValue := cpuQuantity.Value()
 	if !isIntegralCPUAmount(cpuQuantity) {
-		logger.V(5).Info("Exclusive CPU allocation skipped, container requested non-integral CPUs", "pod", klog.KObj(pod), "containerName", container.Name, "cpu", cpuValue)
+		if logger.V(5).Enabled() {
+			logger.V(5).Info("Exclusive CPU allocation skipped, container requested non-integral CPUs", "pod", klog.KObj(pod), "containerName", container.Name, "cpu", cpuValue)
+		}
 		return 0
 	}
 	// Safe downcast to do for all systems with < 2.1 billion CPUs.
@@ -1088,14 +1197,15 @@ func (p *staticPolicy) podGuaranteedCPUs(logger klog.Logger, pod *v1.Pod) int {
 	// The maximum of requested CPUs by init containers.
 	requestedByInitContainers := 0
 	requestedByRestartableInitContainers := 0
-	for _, container := range pod.Spec.InitContainers {
+	for i := range pod.Spec.InitContainers {
+		container := &pod.Spec.InitContainers[i]
 		if _, ok := container.Resources.Requests[v1.ResourceCPU]; !ok {
 			continue
 		}
-		requestedCPU := p.guaranteedCPUs(logger, pod, &container)
+		requestedCPU := p.guaranteedCPUs(logger, pod, container)
 		// See https://github.com/kubernetes/enhancements/tree/master/keps/sig-node/753-sidecar-containers#resources-calculation-for-scheduling-and-pod-admission
 		// for the detail.
-		if podutil.IsRestartableInitContainer(&container) {
+		if podutil.IsRestartableInitContainer(container) {
 			requestedByRestartableInitContainers += requestedCPU
 		} else if requestedByRestartableInitContainers+requestedCPU > requestedByInitContainers {
 			requestedByInitContainers = requestedByRestartableInitContainers + requestedCPU
@@ -1104,11 +1214,12 @@ func (p *staticPolicy) podGuaranteedCPUs(logger klog.Logger, pod *v1.Pod) int {
 
 	// The sum of requested CPUs by app containers.
 	requestedByAppContainers := 0
-	for _, container := range pod.Spec.Containers {
+	for i := range pod.Spec.Containers {
+		container := &pod.Spec.Containers[i]
 		if _, ok := container.Resources.Requests[v1.ResourceCPU]; !ok {
 			continue
 		}
-		requestedByAppContainers += p.guaranteedCPUs(logger, pod, &container)
+		requestedByAppContainers += p.guaranteedCPUs(logger, pod, container)
 	}
 
 	requestedByLongRunningContainers := requestedByAppContainers + requestedByRestartableInitContainers
@@ -1136,7 +1247,9 @@ func (p *staticPolicy) takeByTopology(logger klog.Logger, availableCPUs cpuset.C
 }
 
 func (p *staticPolicy) GetTopologyHints(logger klog.Logger, s state.State, pod *v1.Pod, container *v1.Container, operation lifecycle.Operation) map[string][]topologymanager.TopologyHint {
-	logger = klog.LoggerWithValues(logger, "pod", klog.KObj(pod), "podUID", pod.UID, "containerName", container.Name, "operation", operation)
+	if logger.Enabled() {
+		logger = klog.LoggerWithValues(logger, "pod", klog.KObj(pod), "podUID", pod.UID, "containerName", container.Name, "operation", operation)
+	}
 	switch operation {
 	case lifecycle.AddOperation:
 		return p.getTopologyHintsForAdd(logger, s, pod, container)
@@ -1169,7 +1282,7 @@ func (p *staticPolicy) getTopologyHintsForAdd(logger klog.Logger, s state.State,
 	// Short circuit to regenerate the same hints if there are already
 	// guaranteed CPUs allocated to the Container. This might happen after a
 	// kubelet restart, for example.
-	if allocated, exists := s.GetCPUSet(string(pod.UID), container.Name); exists {
+	if allocated, exists := getCPUSetView(s, string(pod.UID), container.Name); exists {
 		if allocated.Size() != requested {
 			logger.Info("CPUs already allocated to container with different number than request", "requestedSize", requested, "allocatedSize", allocated.Size())
 			// An empty list of hints will be treated as a preference that cannot be satisfied.
@@ -1206,7 +1319,9 @@ func (p *staticPolicy) getTopologyHintsForAdd(logger klog.Logger, s state.State,
 }
 
 func (p *staticPolicy) GetPodTopologyHints(logger klog.Logger, s state.State, pod *v1.Pod, operation lifecycle.Operation) map[string][]topologymanager.TopologyHint {
-	logger = klog.LoggerWithValues(logger, "pod", klog.KObj(pod), "podUID", pod.UID, "operation", operation)
+	if logger.Enabled() {
+		logger = klog.LoggerWithValues(logger, "pod", klog.KObj(pod), "podUID", pod.UID, "operation", operation)
+	}
 	switch operation {
 	case lifecycle.AddOperation:
 		return p.getPodTopologyHintsForAdd(logger, s, pod)
@@ -1217,7 +1332,9 @@ func (p *staticPolicy) GetPodTopologyHints(logger klog.Logger, s state.State, po
 }
 
 func (p *staticPolicy) getPodTopologyHintsForAdd(logger klog.Logger, s state.State, pod *v1.Pod) map[string][]topologymanager.TopologyHint {
-	logger = klog.LoggerWithValues(logger, "pod", klog.KObj(pod), "podUID", pod.UID)
+	if logger.Enabled() {
+		logger = klog.LoggerWithValues(logger, "pod", klog.KObj(pod), "podUID", pod.UID)
+	}
 
 	// Get a count of how many guaranteed CPUs have been requested by Pod.
 	requested := p.podGuaranteedCPUs(logger, pod)
@@ -1254,7 +1371,7 @@ func (p *staticPolicy) getPodTopologyHintsForAdd(logger klog.Logger, s state.Sta
 	// that will be released back to the default pool.
 	staleCPUs := cpuset.New()
 	if utilfeature.DefaultFeatureGate.Enabled(features.PodLevelResourceManagers) && resourcehelper.IsPodLevelResourcesSet(pod) {
-		if allocated, exists := s.GetPodCPUSet(string(pod.UID)); exists && !allocated.IsEmpty() {
+		if allocated, exists := getPodCPUSetView(s, string(pod.UID)); exists && !allocated.IsEmpty() {
 			if podAllocationStaleness(s, pod, allocated) == notStale {
 				if allocated.Size() != requested {
 					logger.V(2).Info("Pod-level CPUs already allocated with a different number than requested", "requested", requested, "allocated", allocated.Size())
@@ -1304,25 +1421,30 @@ func (p *staticPolicy) getPodTopologyHintsForAdd(logger klog.Logger, s state.Sta
 	// its zero request) or constrain the NUMA affinity to CPUs the pod is not
 	// going to keep.
 	if staleCPUs.IsEmpty() {
-		for container := range podutil.ContainerIter(&pod.Spec, podutil.InitContainers|podutil.Containers) {
-			logger_ := klog.LoggerWithValues(logger, "containerName", container.Name)
-
-			requestedByContainer := p.guaranteedCPUs(logger, pod, container)
-			// Short circuit to regenerate the same hints if there are already
-			// guaranteed CPUs allocated to the Container. This might happen after a
-			// kubelet restart, for example.
-			if allocated, exists := s.GetCPUSet(string(pod.UID), container.Name); exists {
-				if allocated.Size() != requestedByContainer {
-					logger_.Info("CPUs already allocated to container with different number than request", "requestedByContainer", requestedByContainer, "allocatedSize", allocated.Size())
-					// An empty list of hints will be treated as a preference that cannot be satisfied.
-					// In definition of hints this is equal to: TopologyHint[NUMANodeAffinity: nil, Preferred: false].
-					// For all but the best-effort policy, the Topology Manager will throw a pod-admission error.
-					return map[string][]topologymanager.TopologyHint{
-						string(v1.ResourceCPU): {},
+		for pass := 0; pass < 2; pass++ {
+			containers := pod.Spec.InitContainers
+			if pass == 1 {
+				containers = pod.Spec.Containers
+			}
+			for i := range containers {
+				container := &containers[i]
+				requestedByContainer := p.guaranteedCPUs(logger, pod, container)
+				// Short circuit to regenerate the same hints if there are already
+				// guaranteed CPUs allocated to the Container. This might happen after a
+				// kubelet restart, for example.
+				if allocated, exists := getCPUSetView(s, string(pod.UID), container.Name); exists {
+					if allocated.Size() != requestedByContainer {
+						klog.LoggerWithValues(logger, "containerName", container.Name).Info("CPUs already allocated to container with different number than request", "requestedByContainer", requestedByContainer, "allocatedSize", allocated.Size())
+						// An empty list of hints will be treated as a preference that cannot be satisfied.
+						// In definition of hints this is equal to: TopologyHint[NUMANodeAffinity: nil, Preferred: false].
+						// For all but the best-effort policy, the Topology Manager will throw a pod-admission error.
+						return map[string][]topologymanager.TopologyHint{
+							string(v1.ResourceCPU): {},
+						}
 					}
+					// A set of CPUs already assigned to containers in this pod
+					assignedCPUs = assignedCPUs.Union(allocated)
 				}
-				// A set of CPUs already assigned to containers in this pod
-				assignedCPUs = assignedCPUs.Union(allocated)
 			}
 		}
 		if assignedCPUs.Size() == requested {
@@ -1345,7 +1467,7 @@ func (p *staticPolicy) getPodTopologyHintsForAdd(logger klog.Logger, s state.Sta
 		// CPUs into the available set, keeps the reserved CPUs out even if the
 		// reserved set changed while the stale entry was sitting in the
 		// checkpoint.
-		available = s.GetDefaultCPUSet().Union(staleCPUs).Difference(p.reservedCPUs)
+		available = getDefaultCPUSetView(s).Union(staleCPUs).Difference(p.reservedCPUs)
 	}
 
 	// Get a list of reusable CPUs (e.g. CPUs reused from initContainers).
@@ -1353,7 +1475,9 @@ func (p *staticPolicy) getPodTopologyHintsForAdd(logger klog.Logger, s state.Sta
 	reusable := p.cpusToReuse[string(pod.UID)]
 
 	// Ensure any CPUs already assigned to containers in this pod are included as part of the hint generation.
-	reusable = reusable.Union(assignedCPUs)
+	if !assignedCPUs.IsEmpty() {
+		reusable = reusable.Union(assignedCPUs)
+	}
 
 	// Generate hints. Outside of regeneration the usable CPUs are exactly the
 	// free ones, so the same set drives both feasibility and the Score.
@@ -1381,9 +1505,96 @@ func (p *staticPolicy) generateCPUTopologyHints(usableCPUs cpuset.CPUSet, reusab
 	// Initialize minAffinitySize to include all NUMA Nodes.
 	minAffinitySize := len(p.numaNodes)
 
+	var cpusInNUMANode [64]int
+	var allocatableInNUMANode [64]int
+	var usableInNUMANode [64]int
+	var freeInNUMANode [64]int
+
+	canUseFastNUMACounts := len(p.numaNodes) > 0 && len(p.numaNodes) <= 16
+	for _, n := range p.numaNodes {
+		if n < 0 || n >= 64 {
+			canUseFastNUMACounts = false
+			break
+		}
+	}
+
+	var reusableList []int
+	if !reusableCPUs.IsEmpty() {
+		reusableList = reusableCPUs.List()
+	}
+
+	if canUseFastNUMACounts {
+		for cpuID, info := range p.topology.CPUDetails {
+			if info.NUMANodeID >= 0 && info.NUMANodeID < 64 {
+				cpusInNUMANode[info.NUMANodeID]++
+				if !p.reservedCPUs.Contains(cpuID) {
+					allocatableInNUMANode[info.NUMANodeID]++
+				}
+			}
+		}
+		for _, c := range usableCPUs.UnsortedList() {
+			n := p.topology.CPUDetails[c].NUMANodeID
+			if n >= 0 && n < 64 {
+				usableInNUMANode[n]++
+			} else {
+				canUseFastNUMACounts = false
+			}
+		}
+		for _, c := range freeCPUs.UnsortedList() {
+			if info, ok := p.topology.CPUDetails[c]; ok && info.NUMANodeID >= 0 && info.NUMANodeID < 64 {
+				freeInNUMANode[info.NUMANodeID]++
+			}
+		}
+	}
+
+	var usableList []int
+	if !canUseFastNUMACounts {
+		usableList = usableCPUs.List()
+	}
+
+	hintCap := 0
+	if len(p.numaNodes) > 0 && len(p.numaNodes) <= 8 {
+		hintCap = (1 << len(p.numaNodes)) - 1
+	}
+	hints := make([]topologymanager.TopologyHint, 0, hintCap)
+
 	// Iterate through all combinations of numa nodes bitmask and build hints from them.
-	hints := []topologymanager.TopologyHint{}
 	bitmask.IterateBitMasks(p.numaNodes, func(mask bitmask.BitMask) {
+		if canUseFastNUMACounts {
+			cpusInMask := 0
+			allocatable := 0
+			free := 0
+			numMatching := 0
+			for _, n := range p.numaNodes {
+				if mask.IsSet(n) {
+					cpusInMask += cpusInNUMANode[n]
+					allocatable += allocatableInNUMANode[n]
+					free += freeInNUMANode[n]
+					numMatching += usableInNUMANode[n]
+				}
+			}
+			maskCount := mask.Count()
+			if cpusInMask >= request && maskCount < minAffinitySize {
+				minAffinitySize = maskCount
+			}
+			for _, c := range reusableList {
+				if !mask.IsSet(p.topology.CPUDetails[c].NUMANodeID) {
+					return
+				}
+				numMatching++
+			}
+			if numMatching < request {
+				return
+			}
+			score := topologymanager.UtilizationScore(int64(allocatable), int64(allocatable-free))
+			hints = append(hints, topologymanager.TopologyHint{
+				NUMANodeAffinity: mask,
+				Preferred:        false,
+				Score:            score,
+			})
+			return
+		}
+
 		// First, update minAffinitySize for the current request size.
 		cpusInMaskSet := p.topology.CPUDetails.CPUsInNUMANodes(mask.GetBits()...)
 		cpusInMask := cpusInMaskSet.Size()
@@ -1394,7 +1605,7 @@ func (p *staticPolicy) generateCPUTopologyHints(usableCPUs cpuset.CPUSet, reusab
 		// Then check to see if we have enough CPUs available on the current
 		// numa node bitmask to satisfy the CPU request.
 		numMatching := 0
-		for _, c := range reusableCPUs.List() {
+		for _, c := range reusableList {
 			// Disregard this mask if its NUMANode isn't part of it.
 			if !mask.IsSet(p.topology.CPUDetails[c].NUMANodeID) {
 				return
@@ -1404,7 +1615,7 @@ func (p *staticPolicy) generateCPUTopologyHints(usableCPUs cpuset.CPUSet, reusab
 
 		// Finally, check to see if enough available CPUs remain on the current
 		// NUMA node combination to satisfy the CPU request.
-		for _, c := range usableCPUs.List() {
+		for _, c := range usableList {
 			if mask.IsSet(p.topology.CPUDetails[c].NUMANodeID) {
 				numMatching++
 			}
@@ -1529,13 +1740,17 @@ func (p *staticPolicy) updateMetricsOnAllocate(logger klog.Logger, s state.State
 // This is union of all CPU sets allocated for containers using exclusive CPUs and
 // pods using pod-level exclusive CPU sets (the "bubble" allocation for whole pod is used).
 func getTotalAssignedExclusiveCPUs(s state.State) cpuset.CPUSet {
+	includePodLevel := utilfeature.DefaultFeatureGate.Enabled(features.PodLevelResourceManagers)
+	if fr, ok := s.(state.FastReader); ok {
+		return fr.GetTotalAssignedExclusiveCPUs(includePodLevel)
+	}
 	totalAssignedCPUs := cpuset.New()
 	for _, assignment := range s.GetCPUAssignments() {
 		for _, cset := range assignment {
 			totalAssignedCPUs = totalAssignedCPUs.Union(cset)
 		}
 	}
-	if utilfeature.DefaultFeatureGate.Enabled(features.PodLevelResourceManagers) {
+	if includePodLevel {
 		for _, podEntry := range s.GetPodCPUAssignments() {
 			totalAssignedCPUs = totalAssignedCPUs.Union(podEntry.CPUSet)
 		}
@@ -1544,7 +1759,8 @@ func getTotalAssignedExclusiveCPUs(s state.State) cpuset.CPUSet {
 }
 
 func updateAllocationPerNUMAMetric(logger klog.Logger, topo *topology.CPUTopology, allocatedCPUs cpuset.CPUSet, numaNodes []int) {
-	numaCount := make(map[int]int)
+	var stackCounts [64]int
+	var numaCount map[int]int
 
 	// Count CPUs allocated per NUMA node
 	for _, cpuID := range allocatedCPUs.UnsortedList() {
@@ -1554,7 +1770,14 @@ func updateAllocationPerNUMAMetric(logger klog.Logger, topo *topology.CPUTopolog
 			//      is already computed, evaluated and there is no room for user tampering.
 			logger.Error(err, "Unable to determine NUMA node", "cpuID", cpuID)
 		}
-		numaCount[numaNode]++
+		if numaNode >= 0 && numaNode < len(stackCounts) {
+			stackCounts[numaNode]++
+		} else {
+			if numaCount == nil {
+				numaCount = make(map[int]int)
+			}
+			numaCount[numaNode]++
+		}
 	}
 
 	// Update the metric for every NUMA node known to the topology: a NUMA
@@ -1562,7 +1785,13 @@ func updateAllocationPerNUMAMetric(logger klog.Logger, topo *topology.CPUTopolog
 	// gauge would keep reporting the last non-zero value after all the CPUs
 	// of that node went back to the shared pool.
 	for _, numaNode := range numaNodes {
-		metrics.CPUManagerAllocationPerNUMA.WithLabelValues(strconv.Itoa(numaNode)).Set(float64(numaCount[numaNode]))
+		count := 0
+		if numaNode >= 0 && numaNode < len(stackCounts) {
+			count = stackCounts[numaNode]
+		} else if numaCount != nil {
+			count = numaCount[numaNode]
+		}
+		metrics.CPUManagerAllocationPerNUMA.WithLabelValues(strconv.Itoa(numaNode)).Set(float64(count))
 	}
 }
 

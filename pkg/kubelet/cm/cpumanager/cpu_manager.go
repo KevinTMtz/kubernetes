@@ -311,11 +311,13 @@ func (m *manager) AllocatePod(logger klog.Logger, pod *v1.Pod, operation lifecyc
 func (m *manager) AddContainer(logger klog.Logger, pod *v1.Pod, container *v1.Container, containerID string) {
 	m.Lock()
 	defer m.Unlock()
-	if cset, exists := m.state.GetCPUSet(string(pod.UID), container.Name); exists {
+	if cset, exists := getCPUSetView(m.state, string(pod.UID), container.Name); exists {
 		m.lastUpdateState.SetCPUSet(string(pod.UID), container.Name, cset)
 	}
 	m.containerMap.Add(string(pod.UID), container.Name, containerID)
-	logger.V(4).Info("Added Container", "pod", klog.KObj(pod), "podUID", pod.UID, "containerName", container.Name, "containerID", containerID)
+	if logger.V(4).Enabled() {
+		logger.V(4).Info("Added Container", "pod", klog.KObj(pod), "podUID", pod.UID, "containerName", container.Name, "containerID", containerID)
+	}
 }
 
 func (m *manager) RemoveContainer(logger klog.Logger, containerID string) error {
@@ -388,6 +390,72 @@ type reconciledContainer struct {
 	containerID   string
 }
 
+type containerRef struct {
+	podUID        string
+	containerName string
+}
+
+func findActivePod(activePods []*v1.Pod, podUID string) *v1.Pod {
+	for _, pod := range activePods {
+		if string(pod.UID) == podUID {
+			return pod
+		}
+	}
+	return nil
+}
+
+func podHasContainer(pod *v1.Pod, containerName string) bool {
+	if pod == nil {
+		return false
+	}
+	for i := range pod.Spec.InitContainers {
+		if pod.Spec.InitContainers[i].Name == containerName {
+			return true
+		}
+	}
+	for i := range pod.Spec.Containers {
+		if pod.Spec.Containers[i].Name == containerName {
+			return true
+		}
+	}
+	return false
+}
+
+func getCPUSetView(r state.Reader, podUID, containerName string) (cpuset.CPUSet, bool) {
+	if fr, ok := r.(state.FastReader); ok {
+		return fr.GetCPUSetView(podUID, containerName)
+	}
+	return r.GetCPUSet(podUID, containerName)
+}
+
+func getDefaultCPUSetView(r state.Reader) cpuset.CPUSet {
+	if fr, ok := r.(state.FastReader); ok {
+		return fr.GetDefaultCPUSetView()
+	}
+	return r.GetDefaultCPUSet()
+}
+
+func getCPUSetOrDefaultView(r state.Reader, podUID, containerName string) cpuset.CPUSet {
+	if fr, ok := r.(state.FastReader); ok {
+		return fr.GetCPUSetOrDefaultView(podUID, containerName)
+	}
+	return r.GetCPUSetOrDefault(podUID, containerName)
+}
+
+func getPodCPUSetView(r state.Reader, podUID string) (cpuset.CPUSet, bool) {
+	if fr, ok := r.(state.FastReader); ok {
+		return fr.GetPodCPUSetView(podUID)
+	}
+	return r.GetPodCPUSet(podUID)
+}
+
+func getBaselineCPUSetView(r state.Reader, podUID, containerName string) (cpuset.CPUSet, bool) {
+	if fr, ok := r.(state.FastReader); ok {
+		return fr.GetBaselineCPUSetView(podUID, containerName)
+	}
+	return r.GetBaselineCPUSet(podUID, containerName)
+}
+
 func (m *manager) removeStaleState(rootLogger klog.Logger) {
 	// Only once all sources are ready do we attempt to remove any stale state.
 	// This ensures that the call to `m.activePods()` below will succeed with
@@ -405,42 +473,67 @@ func (m *manager) removeStaleState(rootLogger klog.Logger) {
 
 	// Get the list of active pods.
 	activePods := m.activePods()
-
-	// Build a list of (podUID, containerName) pairs for all containers in all active Pods.
-	activeContainers := make(map[string]map[string]struct{})
-	for _, pod := range activePods {
-		activeContainers[string(pod.UID)] = make(map[string]struct{})
-		for _, container := range append(pod.Spec.InitContainers, pod.Spec.Containers...) {
-			activeContainers[string(pod.UID)][container.Name] = struct{}{}
-		}
-	}
+	logV5 := rootLogger.V(5).Enabled()
 
 	// Loop through the CPUManager state. Remove any state for containers not
-	// in the `activeContainers` list built above.
-	assignments := m.state.GetCPUAssignments()
-	for podUID := range assignments {
-		for containerName := range assignments[podUID] {
-			logger := klog.LoggerWithValues(rootLogger, "podUID", podUID, "containerName", containerName)
-
-			if _, ok := activeContainers[podUID][containerName]; ok {
-				logger.V(5).Info("container still active")
-				continue
+	// in the `activePods` list.
+	if fr, ok := m.state.(state.FastReader); ok {
+		var staleRefs []containerRef
+		var lastPodUID string
+		var lastPod *v1.Pod
+		hasLastPod := false
+		fr.ForEachCPUAssignment(func(podUID, containerName string, _ cpuset.CPUSet) {
+			if !hasLastPod || podUID != lastPodUID {
+				lastPodUID = podUID
+				lastPod = findActivePod(activePods, podUID)
+				hasLastPod = true
 			}
-
+			if podHasContainer(lastPod, containerName) {
+				if logV5 {
+					klog.LoggerWithValues(rootLogger, "podUID", podUID, "containerName", containerName).V(5).Info("container still active")
+				}
+				return
+			}
+			staleRefs = append(staleRefs, containerRef{podUID: podUID, containerName: containerName})
+		})
+		for _, ref := range staleRefs {
+			logger := klog.LoggerWithValues(rootLogger, "podUID", ref.podUID, "containerName", ref.containerName)
 			logger.V(2).Info("removing container")
-			err := m.policyRemoveContainerByRef(logger, podUID, containerName)
+			err := m.policyRemoveContainerByRef(logger, ref.podUID, ref.containerName)
 			if err != nil {
 				logger.Error(err, "failed to remove container")
+			}
+		}
+	} else {
+		assignments := m.state.GetCPUAssignments()
+		for podUID := range assignments {
+			pod := findActivePod(activePods, podUID)
+			for containerName := range assignments[podUID] {
+				if podHasContainer(pod, containerName) {
+					if logV5 {
+						klog.LoggerWithValues(rootLogger, "podUID", podUID, "containerName", containerName).V(5).Info("container still active")
+					}
+					continue
+				}
+
+				logger := klog.LoggerWithValues(rootLogger, "podUID", podUID, "containerName", containerName)
+				logger.V(2).Info("removing container")
+				err := m.policyRemoveContainerByRef(logger, podUID, containerName)
+				if err != nil {
+					logger.Error(err, "failed to remove container")
+				}
 			}
 		}
 	}
 
 	m.containerMap.Visit(func(podUID, containerName, containerID string) {
-		logger := klog.LoggerWithValues(rootLogger, "podUID", podUID, "containerName", containerName)
-		if _, ok := activeContainers[podUID][containerName]; ok {
-			logger.V(5).Info("containerMap: container still active")
+		if podHasContainer(findActivePod(activePods, podUID), containerName) {
+			if logV5 {
+				klog.LoggerWithValues(rootLogger, "podUID", podUID, "containerName", containerName).V(5).Info("containerMap: container still active")
+			}
 			return
 		}
+		logger := klog.LoggerWithValues(rootLogger, "podUID", podUID, "containerName", containerName)
 		logger.V(2).Info("containerMap: removing container")
 		err := m.policyRemoveContainerByRef(logger, podUID, containerName)
 		if err != nil {
@@ -450,115 +543,150 @@ func (m *manager) removeStaleState(rootLogger klog.Logger) {
 }
 
 func (m *manager) reconcileState(ctx context.Context) (success []reconciledContainer, failure []reconciledContainer) {
-	success = []reconciledContainer{}
-	failure = []reconciledContainer{}
-
 	rootLogger := klog.FromContext(ctx)
 
 	m.removeStaleState(rootLogger)
-	for _, pod := range m.activePods() {
-		podLogger := klog.LoggerWithValues(rootLogger, "pod", klog.KObj(pod))
+	activePods := m.activePods()
+	success = make([]reconciledContainer, 0, len(activePods))
+	failure = []reconciledContainer{}
 
+	logV2 := rootLogger.V(2).Enabled()
+	logV4 := rootLogger.V(4).Enabled()
+	logV5 := rootLogger.V(5).Enabled()
+	inPlaceExclusiveCPUs := utilfeature.DefaultFeatureGate.Enabled(kubefeatures.InPlacePodVerticalScalingExclusiveCPUs)
+
+	for _, pod := range activePods {
 		pstatus, ok := m.podStatusProvider.GetPodStatus(pod.UID)
 		if !ok {
-			podLogger.V(5).Info("skipping pod; status not found")
+			if logV5 {
+				klog.LoggerWithValues(rootLogger, "pod", klog.KObj(pod)).V(5).Info("skipping pod; status not found")
+			}
 			failure = append(failure, reconciledContainer{pod.Name, "", ""})
 			continue
 		}
 
-		allContainers := pod.Spec.InitContainers
-		allContainers = append(allContainers, pod.Spec.Containers...)
-		for _, container := range allContainers {
-			logger := klog.LoggerWithValues(podLogger, "containerName", container.Name)
-
-			containerID, err := findContainerIDByName(&pstatus, container.Name)
-			if err != nil {
-				logger.V(5).Info("skipping container; ID not found in pod status", "err", err)
-				failure = append(failure, reconciledContainer{pod.Name, container.Name, ""})
-				continue
+		podUID := string(pod.UID)
+		for pass := 0; pass < 2; pass++ {
+			containers := pod.Spec.InitContainers
+			if pass == 1 {
+				containers = pod.Spec.Containers
 			}
+			for i := range containers {
+				containerName := containers[i].Name
 
-			cstatus, err := findContainerStatusByName(&pstatus, container.Name)
-			if err != nil {
-				logger.V(5).Info("skipping container; container status not found in pod status", "err", err)
-				failure = append(failure, reconciledContainer{pod.Name, container.Name, ""})
-				continue
-			}
-
-			if cstatus.State.Waiting != nil ||
-				(cstatus.State.Waiting == nil && cstatus.State.Running == nil && cstatus.State.Terminated == nil) {
-				logger.V(4).Info("skipping container; container still in the waiting state", "err", err)
-				failure = append(failure, reconciledContainer{pod.Name, container.Name, ""})
-				continue
-			}
-
-			m.Lock()
-			if cstatus.State.Terminated != nil {
-				// The container is terminated but we can't call m.RemoveContainer()
-				// here because it could remove the allocated cpuset for the container
-				// which may be in the process of being restarted.  That would result
-				// in the container losing any exclusively-allocated CPUs that it
-				// was allocated.
-				_, _, err := m.containerMap.GetContainerRef(containerID)
-				if err == nil {
-					logger.V(4).Info("ignoring terminated container", "containerID", containerID)
-				}
-				m.Unlock()
-				continue
-			}
-
-			// Once we make it here we know we have a running container.
-			// Idempotently add it to the containerMap incase it is missing.
-			// This can happen after a kubelet restart, for example.
-			m.containerMap.Add(string(pod.UID), container.Name, containerID)
-
-			cset := m.state.GetCPUSetOrDefault(string(pod.UID), container.Name)
-			baselineCPUs, hasBaselineCPUs := m.state.GetBaselineCPUSet(string(pod.UID), container.Name)
-			m.Unlock()
-
-			if cset.IsEmpty() {
-				// NOTE: This should not happen outside of tests.
-				logger.V(2).Info("ReconcileState: skipping container; empty cpuset assigned")
-				failure = append(failure, reconciledContainer{pod.Name, container.Name, containerID})
-				continue
-			}
-
-			if utilfeature.DefaultFeatureGate.Enabled(kubefeatures.InPlacePodVerticalScalingExclusiveCPUs) {
-				// this is less clear than it should be because of the constraints of the GetCPUSetOrDefault API which should
-				// be revisited separately. A container can only have baseline CPUs set if it got an exclusive CPU assignment
-				// the first time it was admitted. Baseline CPUs reflects the CPUs promised at that time, which no following
-				// scaleup/down can ever mutate. In that case, we are also guaranteed that the `GetCPUSetOrDefault` will return
-				// _an_ exclusive CPUSet and never the default set. A clear improvement would be get rid of GetCPUSetOrDefault
-				// and make a new API which returns TWO cpusets: the exclusively allocated and the shared set.
-				if hasBaselineCPUs && !baselineCPUs.Equals(cset) {
-					logger.V(4).Info("Current container CPU assignments differ from CPU assignments recorded at admission time",
-						"currentCPUSet", cset, "baselineCPUSet", baselineCPUs)
-				}
-			}
-
-			lcset := m.lastUpdateState.GetCPUSetOrDefault(string(pod.UID), container.Name)
-			if !cset.Equals(lcset) {
-				logger.V(5).Info("updating container", "containerID", containerID, "cpuSet", cset)
-				err = m.updateContainerCPUSet(ctx, containerID, cset)
+				containerID, err := findContainerIDByName(&pstatus, containerName)
 				if err != nil {
-					logger.Error(err, "failed to update container", "containerID", containerID, "cpuSet", cset)
-					failure = append(failure, reconciledContainer{pod.Name, container.Name, containerID})
+					if logV5 {
+						klog.LoggerWithValues(rootLogger, "pod", klog.KObj(pod), "containerName", containerName).V(5).Info("skipping container; ID not found in pod status", "err", err)
+					}
+					failure = append(failure, reconciledContainer{pod.Name, containerName, ""})
 					continue
 				}
-				m.lastUpdateState.SetCPUSet(string(pod.UID), container.Name, cset)
+
+				cstatus, err := findContainerStatusByName(&pstatus, containerName)
+				if err != nil {
+					if logV5 {
+						klog.LoggerWithValues(rootLogger, "pod", klog.KObj(pod), "containerName", containerName).V(5).Info("skipping container; container status not found in pod status", "err", err)
+					}
+					failure = append(failure, reconciledContainer{pod.Name, containerName, ""})
+					continue
+				}
+
+				if cstatus.State.Waiting != nil ||
+					(cstatus.State.Waiting == nil && cstatus.State.Running == nil && cstatus.State.Terminated == nil) {
+					if logV4 {
+						klog.LoggerWithValues(rootLogger, "pod", klog.KObj(pod), "containerName", containerName).V(4).Info("skipping container; container still in the waiting state", "err", err)
+					}
+					failure = append(failure, reconciledContainer{pod.Name, containerName, ""})
+					continue
+				}
+
+				m.Lock()
+				if cstatus.State.Terminated != nil {
+					// The container is terminated but we can't call m.RemoveContainer()
+					// here because it could remove the allocated cpuset for the container
+					// which may be in the process of being restarted.  That would result
+					// in the container losing any exclusively-allocated CPUs that it
+					// was allocated.
+					_, _, err := m.containerMap.GetContainerRef(containerID)
+					if err == nil && logV4 {
+						klog.LoggerWithValues(rootLogger, "pod", klog.KObj(pod), "containerName", containerName).V(4).Info("ignoring terminated container", "containerID", containerID)
+					}
+					m.Unlock()
+					continue
+				}
+
+				// Once we make it here we know we have a running container.
+				// Idempotently add it to the containerMap incase it is missing.
+				// This can happen after a kubelet restart, for example.
+				m.containerMap.Add(podUID, containerName, containerID)
+
+				cset := getCPUSetOrDefaultView(m.state, podUID, containerName)
+				var baselineCPUs cpuset.CPUSet
+				var hasBaselineCPUs bool
+				if inPlaceExclusiveCPUs {
+					baselineCPUs, hasBaselineCPUs = getBaselineCPUSetView(m.state, podUID, containerName)
+				}
+				m.Unlock()
+
+				if cset.IsEmpty() {
+					// NOTE: This should not happen outside of tests.
+					if logV2 {
+						klog.LoggerWithValues(rootLogger, "pod", klog.KObj(pod), "containerName", containerName).V(2).Info("ReconcileState: skipping container; empty cpuset assigned")
+					}
+					failure = append(failure, reconciledContainer{pod.Name, containerName, containerID})
+					continue
+				}
+
+				if inPlaceExclusiveCPUs {
+					// this is less clear than it should be because of the constraints of the GetCPUSetOrDefault API which should
+					// be revisited separately. A container can only have baseline CPUs set if it got an exclusive CPU assignment
+					// the first time it was admitted. Baseline CPUs reflects the CPUs promised at that time, which no following
+					// scaleup/down can ever mutate. In that case, we are also guaranteed that the `GetCPUSetOrDefault` will return
+					// _an_ exclusive CPUSet and never the default set. A clear improvement would be get rid of GetCPUSetOrDefault
+					// and make a new API which returns TWO cpusets: the exclusively allocated and the shared set.
+					if hasBaselineCPUs && !baselineCPUs.Equals(cset) && logV4 {
+						klog.LoggerWithValues(rootLogger, "pod", klog.KObj(pod), "containerName", containerName).V(4).Info("Current container CPU assignments differ from CPU assignments recorded at admission time",
+							"currentCPUSet", cset, "baselineCPUSet", baselineCPUs)
+					}
+				}
+
+				lcset := getCPUSetOrDefaultView(m.lastUpdateState, podUID, containerName)
+				if !cset.Equals(lcset) {
+					if logV5 {
+						klog.LoggerWithValues(rootLogger, "pod", klog.KObj(pod), "containerName", containerName).V(5).Info("updating container", "containerID", containerID, "cpuSet", cset)
+					}
+					err = m.updateContainerCPUSet(ctx, containerID, cset)
+					if err != nil {
+						klog.LoggerWithValues(rootLogger, "pod", klog.KObj(pod), "containerName", containerName).Error(err, "failed to update container", "containerID", containerID, "cpuSet", cset)
+						failure = append(failure, reconciledContainer{pod.Name, containerName, containerID})
+						continue
+					}
+					m.lastUpdateState.SetCPUSet(podUID, containerName, cset)
+				}
+				success = append(success, reconciledContainer{pod.Name, containerName, containerID})
 			}
-			success = append(success, reconciledContainer{pod.Name, container.Name, containerID})
 		}
 	}
 	return success, failure
 }
 
 func findContainerIDByName(status *v1.PodStatus, name string) (string, error) {
-	allStatuses := status.InitContainerStatuses
-	allStatuses = append(allStatuses, status.ContainerStatuses...)
-	for _, container := range allStatuses {
+	for i := range status.InitContainerStatuses {
+		container := &status.InitContainerStatuses[i]
 		if container.Name == name && container.ContainerID != "" {
-			cid := &kubecontainer.ContainerID{}
+			var cid kubecontainer.ContainerID
+			err := cid.ParseString(container.ContainerID)
+			if err != nil {
+				return "", err
+			}
+			return cid.ID, nil
+		}
+	}
+	for i := range status.ContainerStatuses {
+		container := &status.ContainerStatuses[i]
+		if container.Name == name && container.ContainerID != "" {
+			var cid kubecontainer.ContainerID
 			err := cid.ParseString(container.ContainerID)
 			if err != nil {
 				return "", err
@@ -570,9 +698,14 @@ func findContainerIDByName(status *v1.PodStatus, name string) (string, error) {
 }
 
 func findContainerStatusByName(status *v1.PodStatus, name string) (*v1.ContainerStatus, error) {
-	for _, containerStatus := range append(status.InitContainerStatuses, status.ContainerStatuses...) {
-		if containerStatus.Name == name {
-			return &containerStatus, nil
+	for i := range status.InitContainerStatuses {
+		if status.InitContainerStatuses[i].Name == name {
+			return &status.InitContainerStatuses[i], nil
+		}
+	}
+	for i := range status.ContainerStatuses {
+		if status.ContainerStatuses[i].Name == name {
+			return &status.ContainerStatuses[i], nil
 		}
 	}
 	return nil, fmt.Errorf("unable to find status for container with name %v in pod status (it may not be running)", name)
@@ -606,7 +739,7 @@ func resourcesQualifyForExclusiveCPUs(container *v1.Container) bool {
 }
 
 func (m *manager) GetResourceIsolationLevel(pod *v1.Pod, container *v1.Container) cmqos.ResourceIsolationLevel {
-	if _, ok := m.state.GetCPUSet(string(pod.UID), container.Name); !ok {
+	if _, ok := getCPUSetView(m.state, string(pod.UID), container.Name); !ok {
 		return cmqos.ResourceIsolationHost
 	}
 

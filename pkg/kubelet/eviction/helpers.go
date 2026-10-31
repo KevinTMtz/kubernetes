@@ -31,7 +31,7 @@ import (
 	corev1helpers "k8s.io/component-helpers/scheduling/corev1"
 	"k8s.io/klog/v2"
 	statsapi "k8s.io/kubelet/pkg/apis/stats/v1alpha1"
-	v1resource "k8s.io/kubernetes/pkg/api/v1/resource"
+	podutil "k8s.io/kubernetes/pkg/api/v1/pod"
 	"k8s.io/kubernetes/pkg/features"
 	evictionapi "k8s.io/kubernetes/pkg/kubelet/eviction/api"
 	kubetypes "k8s.io/kubernetes/pkg/kubelet/types"
@@ -532,30 +532,90 @@ func processUsage(processStats *statsapi.ProcessStats) uint64 {
 // localVolumeNames returns the set of volumes for the pod that are local
 // TODO: summary API should report what volumes consume local storage rather than hard-code here.
 func localVolumeNames(pod *v1.Pod) []string {
-	result := []string{}
-	for _, volume := range pod.Spec.Volumes {
-		if volume.HostPath != nil ||
-			volumeutils.IsLocalEphemeralVolume(volume) {
-			result = append(result, volume.Name)
+	count := 0
+	for i := range pod.Spec.Volumes {
+		if pod.Spec.Volumes[i].HostPath != nil ||
+			volumeutils.IsLocalEphemeralVolume(pod.Spec.Volumes[i]) {
+			count++
+		}
+	}
+	if count == 0 {
+		return []string{}
+	}
+	result := make([]string, 0, count)
+	for i := range pod.Spec.Volumes {
+		if pod.Spec.Volumes[i].HostPath != nil ||
+			volumeutils.IsLocalEphemeralVolume(pod.Spec.Volumes[i]) {
+			result = append(result, pod.Spec.Volumes[i].Name)
 		}
 	}
 	return result
 }
 
-// containerUsage aggregates container disk usage and inode consumption for the specified stats to measure.
-func containerUsage(podStats statsapi.PodStats, statsToMeasure []fsStatsType) v1.ResourceList {
-	disk := resource.Quantity{Format: resource.BinarySI}
-	inodes := resource.Quantity{Format: resource.DecimalSI}
-	for _, container := range podStats.Containers {
-		if hasFsStatsType(statsToMeasure, fsStatsRoot) {
-			disk.Add(*diskUsage(container.Rootfs))
-			inodes.Add(*inodeUsage(container.Rootfs))
+func addFsStatsUsage(fsStats *statsapi.FsStats, disk, inodes *resource.Quantity) {
+	if fsStats == nil {
+		return
+	}
+	if fsStats.UsedBytes != nil {
+		disk.Add(*resource.NewQuantity(int64(*fsStats.UsedBytes), resource.BinarySI))
+	}
+	if fsStats.InodesUsed != nil {
+		inodes.Add(*resource.NewQuantity(int64(*fsStats.InodesUsed), resource.DecimalSI))
+	}
+}
+
+func containerUsageValues(podStats *statsapi.PodStats, measureRoot, measureLogs bool) (disk, inodes resource.Quantity) {
+	disk = resource.Quantity{Format: resource.BinarySI}
+	inodes = resource.Quantity{Format: resource.DecimalSI}
+	if !measureRoot && !measureLogs {
+		return disk, inodes
+	}
+	for i := range podStats.Containers {
+		container := &podStats.Containers[i]
+		if measureRoot {
+			addFsStatsUsage(container.Rootfs, &disk, &inodes)
 		}
-		if hasFsStatsType(statsToMeasure, fsStatsLogs) {
-			disk.Add(*diskUsage(container.Logs))
-			inodes.Add(*inodeUsage(container.Logs))
+		if measureLogs {
+			addFsStatsUsage(container.Logs, &disk, &inodes)
 		}
 	}
+	return disk, inodes
+}
+
+func podDiskUsageValues(podStats *statsapi.PodStats, pod *v1.Pod, measureRoot, measureLogs, measureLocalVolume bool) (disk, inodes resource.Quantity) {
+	disk = resource.Quantity{Format: resource.BinarySI}
+	inodes = resource.Quantity{Format: resource.DecimalSI}
+	if measureRoot || measureLogs {
+		for i := range podStats.Containers {
+			container := &podStats.Containers[i]
+			if measureRoot {
+				addFsStatsUsage(container.Rootfs, &disk, &inodes)
+			}
+			if measureLogs {
+				addFsStatsUsage(container.Logs, &disk, &inodes)
+			}
+		}
+	}
+	if measureLocalVolume && pod != nil && len(pod.Spec.Volumes) > 0 && len(podStats.VolumeStats) > 0 {
+		for i := range pod.Spec.Volumes {
+			if pod.Spec.Volumes[i].HostPath != nil ||
+				volumeutils.IsLocalEphemeralVolume(pod.Spec.Volumes[i]) {
+				volName := pod.Spec.Volumes[i].Name
+				for j := range podStats.VolumeStats {
+					if podStats.VolumeStats[j].Name == volName {
+						addFsStatsUsage(&podStats.VolumeStats[j].FsStats, &disk, &inodes)
+						break
+					}
+				}
+			}
+		}
+	}
+	return disk, inodes
+}
+
+// containerUsage aggregates container disk usage and inode consumption for the specified stats to measure.
+func containerUsage(podStats statsapi.PodStats, statsToMeasure []fsStatsType) v1.ResourceList {
+	disk, inodes := containerUsageValues(&podStats, hasFsStatsType(statsToMeasure, fsStatsRoot), hasFsStatsType(statsToMeasure, fsStatsLogs))
 	return v1.ResourceList{
 		v1.ResourceEphemeralStorage: disk,
 		resourceInodes:              inodes,
@@ -567,10 +627,9 @@ func podLocalVolumeUsage(volumeNames []string, podStats statsapi.PodStats) v1.Re
 	disk := resource.Quantity{Format: resource.BinarySI}
 	inodes := resource.Quantity{Format: resource.DecimalSI}
 	for _, volumeName := range volumeNames {
-		for _, volumeStats := range podStats.VolumeStats {
-			if volumeStats.Name == volumeName {
-				disk.Add(*diskUsage(&volumeStats.FsStats))
-				inodes.Add(*inodeUsage(&volumeStats.FsStats))
+		for i := range podStats.VolumeStats {
+			if podStats.VolumeStats[i].Name == volumeName {
+				addFsStatsUsage(&podStats.VolumeStats[i].FsStats, &disk, &inodes)
 				break
 			}
 		}
@@ -583,19 +642,13 @@ func podLocalVolumeUsage(volumeNames []string, podStats statsapi.PodStats) v1.Re
 
 // podDiskUsage aggregates pod disk usage and inode consumption for the specified stats to measure.
 func podDiskUsage(podStats statsapi.PodStats, pod *v1.Pod, statsToMeasure []fsStatsType) (v1.ResourceList, error) {
-	disk := resource.Quantity{Format: resource.BinarySI}
-	inodes := resource.Quantity{Format: resource.DecimalSI}
-
-	containerUsageList := containerUsage(podStats, statsToMeasure)
-	disk.Add(containerUsageList[v1.ResourceEphemeralStorage])
-	inodes.Add(containerUsageList[resourceInodes])
-
-	if hasFsStatsType(statsToMeasure, fsStatsLocalVolumeSource) {
-		volumeNames := localVolumeNames(pod)
-		podLocalVolumeUsageList := podLocalVolumeUsage(volumeNames, podStats)
-		disk.Add(podLocalVolumeUsageList[v1.ResourceEphemeralStorage])
-		inodes.Add(podLocalVolumeUsageList[resourceInodes])
-	}
+	disk, inodes := podDiskUsageValues(
+		&podStats,
+		pod,
+		hasFsStatsType(statsToMeasure, fsStatsRoot),
+		hasFsStatsType(statsToMeasure, fsStatsLogs),
+		hasFsStatsType(statsToMeasure, fsStatsLocalVolumeSource),
+	)
 	return v1.ResourceList{
 		v1.ResourceEphemeralStorage: disk,
 		resourceInodes:              inodes,
@@ -609,13 +662,16 @@ func formatThreshold(threshold evictionapi.Threshold) string {
 
 // cachedStatsFunc returns a statsFunc based on the provided pod stats.
 func cachedStatsFunc(podStats []statsapi.PodStats) statsFunc {
-	uid2PodStats := map[string]statsapi.PodStats{}
+	uid2Idx := make(map[string]int, len(podStats))
 	for i := range podStats {
-		uid2PodStats[podStats[i].PodRef.UID] = podStats[i]
+		uid2Idx[podStats[i].PodRef.UID] = i
 	}
 	return func(pod *v1.Pod) (statsapi.PodStats, bool) {
-		stats, found := uid2PodStats[string(pod.UID)]
-		return stats, found
+		idx, found := uid2Idx[string(pod.UID)]
+		if !found {
+			return statsapi.PodStats{}, false
+		}
+		return podStats[idx], true
 	}
 }
 
@@ -689,6 +745,103 @@ func priority(p1, p2 *v1.Pod) int {
 	return -1
 }
 
+func getPodResourceRequestQuantity(pod *v1.Pod, resourceName v1.ResourceName) resource.Quantity {
+	var requestQuantity resource.Quantity
+	switch resourceName {
+	case v1.ResourceCPU:
+		requestQuantity = resource.Quantity{Format: resource.DecimalSI}
+	case v1.ResourceMemory, v1.ResourceStorage, v1.ResourceEphemeralStorage:
+		requestQuantity = resource.Quantity{Format: resource.BinarySI}
+	default:
+		requestQuantity = resource.Quantity{Format: resource.DecimalSI}
+	}
+	if pod == nil {
+		return requestQuantity
+	}
+
+	if pod.Spec.Resources != nil && utilfeature.DefaultFeatureGate.Enabled(features.PodLevelResources) && resourcehelper.IsPodLevelResourcesSet(pod) {
+		if resourcehelper.IsPodLevelRequestsSet(pod) && resourcehelper.IsSupportedPodLevelResource(resourceName) {
+			if rQuantity, ok := pod.Spec.Resources.Requests[resourceName]; ok {
+				requestQuantity.Add(rQuantity)
+			}
+		}
+	} else {
+		var total resource.Quantity
+		var found bool
+		for i := range pod.Spec.Containers {
+			if rQuantity, ok := pod.Spec.Containers[i].Resources.Requests[resourceName]; ok {
+				if !found {
+					total = rQuantity.DeepCopy()
+					found = true
+				} else {
+					total.Add(rQuantity)
+				}
+			}
+		}
+		if len(pod.Spec.InitContainers) > 0 {
+			var restartableTotal resource.Quantity
+			var restartableFound bool
+			var initMax resource.Quantity
+			var initFound bool
+			for i := range pod.Spec.InitContainers {
+				c := &pod.Spec.InitContainers[i]
+				qty, hasQty := c.Resources.Requests[resourceName]
+				if podutil.IsRestartableInitContainer(c) {
+					if hasQty {
+						if !found {
+							total = qty.DeepCopy()
+							found = true
+						} else {
+							total.Add(qty)
+						}
+						if !restartableFound {
+							restartableTotal = qty.DeepCopy()
+							restartableFound = true
+						} else {
+							restartableTotal.Add(qty)
+						}
+						if !initFound || restartableTotal.Cmp(initMax) > 0 {
+							initMax = restartableTotal.DeepCopy()
+							initFound = true
+						}
+					}
+				} else if hasQty {
+					combined := qty.DeepCopy()
+					if restartableFound {
+						combined.Add(restartableTotal)
+					}
+					if !initFound || combined.Cmp(initMax) > 0 {
+						initMax = combined
+						initFound = true
+					}
+				}
+			}
+			if initFound && (!found || initMax.Cmp(total) > 0) {
+				total = initMax
+				found = true
+			}
+		}
+		if found {
+			requestQuantity.Add(total)
+		}
+	}
+
+	if len(pod.Spec.Overhead) > 0 {
+		if podOverhead, ok := pod.Spec.Overhead[resourceName]; ok && !requestQuantity.IsZero() {
+			requestQuantity.Add(podOverhead)
+		}
+	}
+
+	return requestQuantity
+}
+
+func memoryUsageValue(memStats *statsapi.MemoryStats) resource.Quantity {
+	if memStats == nil || memStats.WorkingSetBytes == nil {
+		return resource.Quantity{Format: resource.BinarySI}
+	}
+	return *resource.NewQuantity(int64(*memStats.WorkingSetBytes), resource.BinarySI)
+}
+
 // exceedMemoryRequests compares whether or not pods' memory usage exceeds their requests
 func exceedMemoryRequests(stats statsFunc) cmpFunc {
 	return func(p1, p2 *v1.Pod) int {
@@ -699,10 +852,10 @@ func exceedMemoryRequests(stats statsFunc) cmpFunc {
 			return cmpBool(!p1Found, !p2Found)
 		}
 
-		p1Memory := memoryUsage(p1Stats.Memory)
-		p2Memory := memoryUsage(p2Stats.Memory)
-		p1ExceedsRequests := p1Memory.Cmp(v1resource.GetResourceRequestQuantity(p1, v1.ResourceMemory)) == 1
-		p2ExceedsRequests := p2Memory.Cmp(v1resource.GetResourceRequestQuantity(p2, v1.ResourceMemory)) == 1
+		p1Memory := memoryUsageValue(p1Stats.Memory)
+		p2Memory := memoryUsageValue(p2Stats.Memory)
+		p1ExceedsRequests := p1Memory.Cmp(getPodResourceRequestQuantity(p1, v1.ResourceMemory)) == 1
+		p2ExceedsRequests := p2Memory.Cmp(getPodResourceRequestQuantity(p2, v1.ResourceMemory)) == 1
 		// prioritize evicting the pod which exceeds its requests
 		return cmpBool(p1ExceedsRequests, p2ExceedsRequests)
 	}
@@ -719,16 +872,16 @@ func memory(stats statsFunc) cmpFunc {
 		}
 
 		// adjust p1, p2 usage relative to the request (if any)
-		p1Memory := memoryUsage(p1Stats.Memory)
-		p1Request := v1resource.GetResourceRequestQuantity(p1, v1.ResourceMemory)
+		p1Memory := memoryUsageValue(p1Stats.Memory)
+		p1Request := getPodResourceRequestQuantity(p1, v1.ResourceMemory)
 		p1Memory.Sub(p1Request)
 
-		p2Memory := memoryUsage(p2Stats.Memory)
-		p2Request := v1resource.GetResourceRequestQuantity(p2, v1.ResourceMemory)
+		p2Memory := memoryUsageValue(p2Stats.Memory)
+		p2Request := getPodResourceRequestQuantity(p2, v1.ResourceMemory)
 		p2Memory.Sub(p2Request)
 
 		// prioritize evicting the pod which has the larger consumption of memory
-		return p2Memory.Cmp(*p1Memory)
+		return p2Memory.Cmp(p1Memory)
 	}
 }
 
@@ -750,6 +903,9 @@ func process(stats statsFunc) cmpFunc {
 
 // exceedDiskRequests compares whether or not pods' disk usage exceeds their requests
 func exceedDiskRequests(stats statsFunc, fsStatsToMeasure []fsStatsType, diskResource v1.ResourceName) cmpFunc {
+	measureRoot := hasFsStatsType(fsStatsToMeasure, fsStatsRoot)
+	measureLogs := hasFsStatsType(fsStatsToMeasure, fsStatsLogs)
+	measureLocalVol := hasFsStatsType(fsStatsToMeasure, fsStatsLocalVolumeSource)
 	return func(p1, p2 *v1.Pod) int {
 		p1Stats, p1Found := stats(p1)
 		p2Stats, p2Found := stats(p2)
@@ -758,17 +914,17 @@ func exceedDiskRequests(stats statsFunc, fsStatsToMeasure []fsStatsType, diskRes
 			return cmpBool(!p1Found, !p2Found)
 		}
 
-		p1Usage, p1Err := podDiskUsage(p1Stats, p1, fsStatsToMeasure)
-		p2Usage, p2Err := podDiskUsage(p2Stats, p2, fsStatsToMeasure)
-		if p1Err != nil || p2Err != nil {
-			// prioritize evicting the pod which had an error getting stats
-			return cmpBool(p1Err != nil, p2Err != nil)
+		p1DiskBytes, p1Inodes := podDiskUsageValues(&p1Stats, p1, measureRoot, measureLogs, measureLocalVol)
+		p2DiskBytes, p2Inodes := podDiskUsageValues(&p2Stats, p2, measureRoot, measureLogs, measureLocalVol)
+		var p1Disk, p2Disk resource.Quantity
+		switch diskResource {
+		case v1.ResourceEphemeralStorage:
+			p1Disk, p2Disk = p1DiskBytes, p2DiskBytes
+		case resourceInodes:
+			p1Disk, p2Disk = p1Inodes, p2Inodes
 		}
-
-		p1Disk := p1Usage[diskResource]
-		p2Disk := p2Usage[diskResource]
-		p1ExceedsRequests := p1Disk.Cmp(v1resource.GetResourceRequestQuantity(p1, diskResource)) == 1
-		p2ExceedsRequests := p2Disk.Cmp(v1resource.GetResourceRequestQuantity(p2, diskResource)) == 1
+		p1ExceedsRequests := p1Disk.Cmp(getPodResourceRequestQuantity(p1, diskResource)) == 1
+		p2ExceedsRequests := p2Disk.Cmp(getPodResourceRequestQuantity(p2, diskResource)) == 1
 		// prioritize evicting the pod which exceeds its requests
 		return cmpBool(p1ExceedsRequests, p2ExceedsRequests)
 	}
@@ -776,6 +932,9 @@ func exceedDiskRequests(stats statsFunc, fsStatsToMeasure []fsStatsType, diskRes
 
 // disk compares pods by largest consumer of disk relative to request for the specified disk resource.
 func disk(stats statsFunc, fsStatsToMeasure []fsStatsType, diskResource v1.ResourceName) cmpFunc {
+	measureRoot := hasFsStatsType(fsStatsToMeasure, fsStatsRoot)
+	measureLogs := hasFsStatsType(fsStatsToMeasure, fsStatsLogs)
+	measureLocalVol := hasFsStatsType(fsStatsToMeasure, fsStatsLocalVolumeSource)
 	return func(p1, p2 *v1.Pod) int {
 		p1Stats, p1Found := stats(p1)
 		p2Stats, p2Found := stats(p2)
@@ -783,19 +942,20 @@ func disk(stats statsFunc, fsStatsToMeasure []fsStatsType, diskResource v1.Resou
 			// prioritize evicting the pod for which no stats were found
 			return cmpBool(!p1Found, !p2Found)
 		}
-		p1Usage, p1Err := podDiskUsage(p1Stats, p1, fsStatsToMeasure)
-		p2Usage, p2Err := podDiskUsage(p2Stats, p2, fsStatsToMeasure)
-		if p1Err != nil || p2Err != nil {
-			// prioritize evicting the pod which had an error getting stats
-			return cmpBool(p1Err != nil, p2Err != nil)
-		}
 
+		p1DiskBytes, p1Inodes := podDiskUsageValues(&p1Stats, p1, measureRoot, measureLogs, measureLocalVol)
+		p2DiskBytes, p2Inodes := podDiskUsageValues(&p2Stats, p2, measureRoot, measureLogs, measureLocalVol)
 		// adjust p1, p2 usage relative to the request (if any)
-		p1Disk := p1Usage[diskResource]
-		p2Disk := p2Usage[diskResource]
-		p1Request := v1resource.GetResourceRequestQuantity(p1, v1.ResourceEphemeralStorage)
+		var p1Disk, p2Disk resource.Quantity
+		switch diskResource {
+		case v1.ResourceEphemeralStorage:
+			p1Disk, p2Disk = p1DiskBytes, p2DiskBytes
+		case resourceInodes:
+			p1Disk, p2Disk = p1Inodes, p2Inodes
+		}
+		p1Request := getPodResourceRequestQuantity(p1, v1.ResourceEphemeralStorage)
 		p1Disk.Sub(p1Request)
-		p2Request := v1resource.GetResourceRequestQuantity(p2, v1.ResourceEphemeralStorage)
+		p2Request := getPodResourceRequestQuantity(p2, v1.ResourceEphemeralStorage)
 		p2Disk.Sub(p2Request)
 		// prioritize evicting the pod which has the larger consumption of disk
 		return p2Disk.Cmp(p1Disk)
@@ -813,11 +973,74 @@ func cmpBool(a, b bool) int {
 	return 1
 }
 
+type pressureRankItem struct {
+	found           bool
+	exceedsRequests bool
+	priority        int32
+	usageAboveReq   resource.Quantity
+}
+
+type pressureRankSorter struct {
+	pods  []*v1.Pod
+	items []pressureRankItem
+}
+
+func (s *pressureRankSorter) Len() int {
+	return len(s.pods)
+}
+
+func (s *pressureRankSorter) Swap(i, j int) {
+	s.pods[i], s.pods[j] = s.pods[j], s.pods[i]
+	s.items[i], s.items[j] = s.items[j], s.items[i]
+}
+
+func (s *pressureRankSorter) Less(i, j int) bool {
+	a, b := &s.items[i], &s.items[j]
+	if !a.found || !b.found {
+		if a.found != b.found {
+			return !a.found
+		}
+		return a.priority < b.priority
+	}
+	if a.exceedsRequests != b.exceedsRequests {
+		return a.exceedsRequests
+	}
+	if a.priority != b.priority {
+		return a.priority < b.priority
+	}
+	return b.usageAboveReq.Cmp(a.usageAboveReq) < 0
+}
+
 // rankMemoryPressure orders the input pods for eviction in response to memory pressure.
 // It ranks by whether or not the pod's usage exceeds its requests, then by priority, and
 // finally by memory usage above requests.
 func rankMemoryPressure(pods []*v1.Pod, stats statsFunc) {
-	orderedBy(exceedMemoryRequests(stats), priority, memory(stats)).Sort(pods)
+	if len(pods) <= 1 {
+		return
+	}
+	items := make([]pressureRankItem, len(pods))
+	for i, pod := range pods {
+		pStats, found := stats(pod)
+		prio := corev1helpers.PodPriority(pod)
+		if !found {
+			items[i] = pressureRankItem{
+				found:    false,
+				priority: prio,
+			}
+			continue
+		}
+		memUsage := memoryUsageValue(pStats.Memory)
+		req := getPodResourceRequestQuantity(pod, v1.ResourceMemory)
+		exceeds := memUsage.Cmp(req) == 1
+		memUsage.Sub(req)
+		items[i] = pressureRankItem{
+			found:           true,
+			exceedsRequests: exceeds,
+			priority:        prio,
+			usageAboveReq:   memUsage,
+		}
+	}
+	sort.Sort(&pressureRankSorter{pods: pods, items: items})
 }
 
 // rankPIDPressure orders the input pods by priority in response to PID pressure.
@@ -827,8 +1050,49 @@ func rankPIDPressure(pods []*v1.Pod, stats statsFunc) {
 
 // rankDiskPressureFunc returns a rankFunc that measures the specified fs stats.
 func rankDiskPressureFunc(fsStatsToMeasure []fsStatsType, diskResource v1.ResourceName) rankFunc {
+	measureRoot := hasFsStatsType(fsStatsToMeasure, fsStatsRoot)
+	measureLogs := hasFsStatsType(fsStatsToMeasure, fsStatsLogs)
+	measureLocalVol := hasFsStatsType(fsStatsToMeasure, fsStatsLocalVolumeSource)
 	return func(pods []*v1.Pod, stats statsFunc) {
-		orderedBy(exceedDiskRequests(stats, fsStatsToMeasure, diskResource), priority, disk(stats, fsStatsToMeasure, diskResource)).Sort(pods)
+		if len(pods) <= 1 {
+			return
+		}
+		items := make([]pressureRankItem, len(pods))
+		for i, pod := range pods {
+			pStats, found := stats(pod)
+			prio := corev1helpers.PodPriority(pod)
+			if !found {
+				items[i] = pressureRankItem{
+					found:    false,
+					priority: prio,
+				}
+				continue
+			}
+			diskBytes, inodesUsed := podDiskUsageValues(&pStats, pod, measureRoot, measureLogs, measureLocalVol)
+			var usage resource.Quantity
+			switch diskResource {
+			case v1.ResourceEphemeralStorage:
+				usage = diskBytes
+			case resourceInodes:
+				usage = inodesUsed
+			}
+			reqForExceed := getPodResourceRequestQuantity(pod, diskResource)
+			exceeds := usage.Cmp(reqForExceed) == 1
+			var ephemReq resource.Quantity
+			if diskResource == v1.ResourceEphemeralStorage {
+				ephemReq = reqForExceed
+			} else {
+				ephemReq = getPodResourceRequestQuantity(pod, v1.ResourceEphemeralStorage)
+			}
+			usage.Sub(ephemReq)
+			items[i] = pressureRankItem{
+				found:           true,
+				exceedsRequests: exceeds,
+				priority:        prio,
+				usageAboveReq:   usage,
+			}
+		}
+		sort.Sort(&pressureRankSorter{pods: pods, items: items})
 	}
 }
 
@@ -848,8 +1112,23 @@ func (a byEvictionPriority) Less(i, j int) bool {
 func makeSignalObservations(logger klog.Logger, summary *statsapi.Summary) (signalObservations, statsFunc) {
 	// build the function to work against for pod stats
 	statsFunc := cachedStatsFunc(summary.Pods)
+	return makeSignalObservationsWithoutStatsFunc(logger, summary), statsFunc
+}
+
+func makeSignalObservationsWithoutStatsFunc(logger klog.Logger, summary *statsapi.Summary) signalObservations {
 	// build an evaluation context for current eviction signals
-	result := signalObservations{}
+	result := make(signalObservations, 9)
+	var quantities [20]resource.Quantity
+	qIdx := 0
+	newQty := func(val int64, format resource.Format) *resource.Quantity {
+		if qIdx < len(quantities) {
+			quantities[qIdx] = *resource.NewQuantity(val, format)
+			q := &quantities[qIdx]
+			qIdx++
+			return q
+		}
+		return resource.NewQuantity(val, format)
+	}
 
 	memoryAvailableSignal := makeMemoryAvailableSignalObservation(logger, summary)
 	if memoryAvailableSignal != nil {
@@ -861,8 +1140,8 @@ func makeSignalObservations(logger klog.Logger, summary *statsapi.Summary) (sign
 	} else {
 		if memory := allocatableContainer.Memory; memory != nil && memory.AvailableBytes != nil && memory.WorkingSetBytes != nil {
 			result[evictionapi.SignalAllocatableMemoryAvailable] = signalObservation{
-				available: resource.NewQuantity(int64(*memory.AvailableBytes), resource.BinarySI),
-				capacity:  resource.NewQuantity(int64(*memory.AvailableBytes+*memory.WorkingSetBytes), resource.BinarySI),
+				available: newQty(int64(*memory.AvailableBytes), resource.BinarySI),
+				capacity:  newQty(int64(*memory.AvailableBytes+*memory.WorkingSetBytes), resource.BinarySI),
 				time:      memory.Time,
 			}
 		}
@@ -870,15 +1149,15 @@ func makeSignalObservations(logger klog.Logger, summary *statsapi.Summary) (sign
 	if nodeFs := summary.Node.Fs; nodeFs != nil {
 		if nodeFs.AvailableBytes != nil && nodeFs.CapacityBytes != nil {
 			result[evictionapi.SignalNodeFsAvailable] = signalObservation{
-				available: resource.NewQuantity(int64(*nodeFs.AvailableBytes), resource.BinarySI),
-				capacity:  resource.NewQuantity(int64(*nodeFs.CapacityBytes), resource.BinarySI),
+				available: newQty(int64(*nodeFs.AvailableBytes), resource.BinarySI),
+				capacity:  newQty(int64(*nodeFs.CapacityBytes), resource.BinarySI),
 				time:      nodeFs.Time,
 			}
 		}
 		if nodeFs.InodesFree != nil && nodeFs.Inodes != nil {
 			result[evictionapi.SignalNodeFsInodesFree] = signalObservation{
-				available: resource.NewQuantity(int64(*nodeFs.InodesFree), resource.DecimalSI),
-				capacity:  resource.NewQuantity(int64(*nodeFs.Inodes), resource.DecimalSI),
+				available: newQty(int64(*nodeFs.InodesFree), resource.DecimalSI),
+				capacity:  newQty(int64(*nodeFs.Inodes), resource.DecimalSI),
 				time:      nodeFs.Time,
 			}
 		}
@@ -887,15 +1166,15 @@ func makeSignalObservations(logger klog.Logger, summary *statsapi.Summary) (sign
 		if imageFs := summary.Node.Runtime.ImageFs; imageFs != nil {
 			if imageFs.AvailableBytes != nil && imageFs.CapacityBytes != nil {
 				result[evictionapi.SignalImageFsAvailable] = signalObservation{
-					available: resource.NewQuantity(int64(*imageFs.AvailableBytes), resource.BinarySI),
-					capacity:  resource.NewQuantity(int64(*imageFs.CapacityBytes), resource.BinarySI),
+					available: newQty(int64(*imageFs.AvailableBytes), resource.BinarySI),
+					capacity:  newQty(int64(*imageFs.CapacityBytes), resource.BinarySI),
 					time:      imageFs.Time,
 				}
 			}
 			if imageFs.InodesFree != nil && imageFs.Inodes != nil {
 				result[evictionapi.SignalImageFsInodesFree] = signalObservation{
-					available: resource.NewQuantity(int64(*imageFs.InodesFree), resource.DecimalSI),
-					capacity:  resource.NewQuantity(int64(*imageFs.Inodes), resource.DecimalSI),
+					available: newQty(int64(*imageFs.InodesFree), resource.DecimalSI),
+					capacity:  newQty(int64(*imageFs.Inodes), resource.DecimalSI),
 					time:      imageFs.Time,
 				}
 			}
@@ -903,15 +1182,15 @@ func makeSignalObservations(logger klog.Logger, summary *statsapi.Summary) (sign
 		if containerFs := summary.Node.Runtime.ContainerFs; containerFs != nil {
 			if containerFs.AvailableBytes != nil && containerFs.CapacityBytes != nil {
 				result[evictionapi.SignalContainerFsAvailable] = signalObservation{
-					available: resource.NewQuantity(int64(*containerFs.AvailableBytes), resource.BinarySI),
-					capacity:  resource.NewQuantity(int64(*containerFs.CapacityBytes), resource.BinarySI),
+					available: newQty(int64(*containerFs.AvailableBytes), resource.BinarySI),
+					capacity:  newQty(int64(*containerFs.CapacityBytes), resource.BinarySI),
 					time:      containerFs.Time,
 				}
 			}
 			if containerFs.InodesFree != nil && containerFs.Inodes != nil {
 				result[evictionapi.SignalContainerFsInodesFree] = signalObservation{
-					available: resource.NewQuantity(int64(*containerFs.InodesFree), resource.DecimalSI),
-					capacity:  resource.NewQuantity(int64(*containerFs.Inodes), resource.DecimalSI),
+					available: newQty(int64(*containerFs.InodesFree), resource.DecimalSI),
+					capacity:  newQty(int64(*containerFs.Inodes), resource.DecimalSI),
 					time:      containerFs.Time,
 				}
 			}
@@ -921,19 +1200,19 @@ func makeSignalObservations(logger klog.Logger, summary *statsapi.Summary) (sign
 		if rlimit.NumOfRunningProcesses != nil && rlimit.MaxPID != nil {
 			available := int64(*rlimit.MaxPID) - int64(*rlimit.NumOfRunningProcesses)
 			result[evictionapi.SignalPIDAvailable] = signalObservation{
-				available: resource.NewQuantity(available, resource.DecimalSI),
-				capacity:  resource.NewQuantity(int64(*rlimit.MaxPID), resource.DecimalSI),
+				available: newQty(available, resource.DecimalSI),
+				capacity:  newQty(int64(*rlimit.MaxPID), resource.DecimalSI),
 				time:      rlimit.Time,
 			}
 		}
 	}
-	return result, statsFunc
+	return result
 }
 
 func getSysContainer(sysContainers []statsapi.ContainerStats, name string) (*statsapi.ContainerStats, error) {
-	for _, cont := range sysContainers {
-		if cont.Name == name {
-			return &cont, nil
+	for i := range sysContainers {
+		if sysContainers[i].Name == name {
+			return &sysContainers[i], nil
 		}
 	}
 	return nil, fmt.Errorf("system container %q not found in metrics", name)
@@ -1016,7 +1295,7 @@ func thresholdsUpdatedStats(logger klog.Logger, thresholds []evictionapi.Thresho
 
 // thresholdsFirstObservedAt merges the input set of thresholds with the previous observation to determine when active set of thresholds were initially met.
 func thresholdsFirstObservedAt(thresholds []evictionapi.Threshold, lastObservedAt thresholdsObservedAt, now time.Time) thresholdsObservedAt {
-	results := thresholdsObservedAt{}
+	results := make(thresholdsObservedAt, len(thresholds))
 	for i := range thresholds {
 		observedAt, found := lastObservedAt[thresholds[i]]
 		if !found {
@@ -1056,7 +1335,7 @@ func nodeConditions(thresholds []evictionapi.Threshold) []v1.NodeConditionType {
 
 // nodeConditionsLastObservedAt merges the input with the previous observation to determine when a condition was most recently met.
 func nodeConditionsLastObservedAt(nodeConditions []v1.NodeConditionType, lastObservedAt nodeConditionsObservedAt, now time.Time) nodeConditionsObservedAt {
-	results := nodeConditionsObservedAt{}
+	results := make(nodeConditionsObservedAt, len(nodeConditions)+len(lastObservedAt))
 	// the input conditions were observed "now"
 	for i := range nodeConditions {
 		results[nodeConditions[i]] = now

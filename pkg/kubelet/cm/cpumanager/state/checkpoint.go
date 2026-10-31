@@ -20,6 +20,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"hash/fnv"
+	"io"
 	"strings"
 
 	utilfeature "k8s.io/apiserver/pkg/util/feature"
@@ -29,6 +30,18 @@ import (
 	"k8s.io/kubernetes/pkg/kubelet/checkpointmanager/errors"
 	"k8s.io/utils/dump"
 )
+
+func computeLegacyCheckpointChecksum(object, oldTypeName string) checksum.Checksum {
+	hash := fnv.New32a()
+	if idx := strings.Index(object, oldTypeName); idx >= 0 {
+		_, _ = io.WriteString(hash, object[:idx])
+		_, _ = io.WriteString(hash, "CPUManagerCheckpoint")
+		_, _ = io.WriteString(hash, object[idx+len(oldTypeName):])
+	} else {
+		_, _ = io.WriteString(hash, object)
+	}
+	return checksum.Checksum(hash.Sum32())
+}
 
 // CPUManagerCheckpointV4 serializes checkpoint data to a string, following the
 // same approach used in the allocation manager (see pkg/kubelet/allocation/state/checkpoint.go).
@@ -133,10 +146,7 @@ func (cp *CPUManagerCheckpointV2) MarshalCheckpoint() ([]byte, error) {
 	// instead of "CPUManagerCheckpointV2". Older Kubelets do not have the string
 	// replacement logic and expect the original struct name.
 	object := dump.ForHash(cp)
-	object = strings.Replace(object, "CPUManagerCheckpointV2", "CPUManagerCheckpoint", 1)
-	hash := fnv.New32a()
-	_, _ = fmt.Fprintf(hash, "%v", object)
-	cp.Checksum = checksum.Checksum(hash.Sum32())
+	cp.Checksum = computeLegacyCheckpointChecksum(object, "CPUManagerCheckpointV2")
 
 	return json.Marshal(*cp)
 }
@@ -151,10 +161,7 @@ func (cp *CPUManagerCheckpointV3) MarshalCheckpoint() ([]byte, error) {
 	// Older Kubelets do not have the string replacement logic
 	// and expect the original struct name.
 	object := dump.ForHash(cp)
-	object = strings.Replace(object, "CPUManagerCheckpointV3", "CPUManagerCheckpoint", 1)
-	hash := fnv.New32a()
-	_, _ = fmt.Fprintf(hash, "%v", object)
-	cp.Checksum = checksum.Checksum(hash.Sum32())
+	cp.Checksum = computeLegacyCheckpointChecksum(object, "CPUManagerCheckpointV3")
 
 	return json.Marshal(*cp)
 }
@@ -174,10 +181,7 @@ func (cp *CPUManagerCheckpoint) MarshalCheckpoint() ([]byte, error) {
 
 	cp.Checksum = 0
 	object := dump.ForHash(&cp.CPUManagerCheckpointV2)
-	object = strings.Replace(object, "CPUManagerCheckpointV2", "CPUManagerCheckpoint", 1)
-	hash := fnv.New32a()
-	_, _ = fmt.Fprintf(hash, "%v", object)
-	cp.Checksum = checksum.Checksum(hash.Sum32())
+	cp.Checksum = computeLegacyCheckpointChecksum(object, "CPUManagerCheckpointV2")
 
 	return json.Marshal(*cp)
 }
@@ -224,12 +228,9 @@ func (cp *CPUManagerCheckpointV2) VerifyChecksum() error {
 	}
 
 	object := dump.ForHash(cp)
-	object = strings.Replace(object, "CPUManagerCheckpointV2", "CPUManagerCheckpoint", 1)
 	cp.Checksum = ck
 
-	hash := fnv.New32a()
-	_, _ = fmt.Fprintf(hash, "%v", object)
-	actualCS := checksum.Checksum(hash.Sum32())
+	actualCS := computeLegacyCheckpointChecksum(object, "CPUManagerCheckpointV2")
 	if cp.Checksum != actualCS {
 		return &errors.CorruptCheckpointError{
 			ActualCS:   uint64(actualCS),
@@ -250,12 +251,9 @@ func (cp *CPUManagerCheckpointV3) VerifyChecksum() error {
 	}
 
 	object := dump.ForHash(cp)
-	object = strings.Replace(object, "CPUManagerCheckpointV3", "CPUManagerCheckpoint", 1)
 	cp.Checksum = ck
 
-	hash := fnv.New32a()
-	_, _ = fmt.Fprintf(hash, "%v", object)
-	actualCS := checksum.Checksum(hash.Sum32())
+	actualCS := computeLegacyCheckpointChecksum(object, "CPUManagerCheckpointV3")
 	if cp.Checksum != actualCS {
 		return &errors.CorruptCheckpointError{
 			ActualCS:   uint64(actualCS),

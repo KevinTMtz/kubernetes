@@ -33,6 +33,7 @@ import (
 )
 
 var _ State = &stateCheckpoint{}
+var _ FastReader = &stateCheckpoint{}
 
 type stateCheckpoint struct {
 	mux               sync.RWMutex
@@ -271,6 +272,52 @@ func (sc *stateCheckpoint) loadCheckpointV2() (*CPUManagerCheckpointV2, error) {
 
 // saves state to a checkpoint, caller is responsible for locking
 func (sc *stateCheckpoint) storeState() error {
+	if mem, ok := sc.cache.(*stateMemory); ok {
+		mem.RLock()
+		entries := make(map[string]map[string]string, len(mem.assignments))
+		for pod, containers := range mem.assignments {
+			podEntries := make(map[string]string, len(containers))
+			for container, cset := range containers {
+				podEntries[container] = cset.String()
+			}
+			entries[pod] = podEntries
+		}
+		var baselines map[string]map[string]ContainerCPUs
+		if utilfeature.DefaultFeatureGate.Enabled(features.InPlacePodVerticalScalingExclusiveCPUs) && len(mem.baselines) > 0 {
+			baselines = make(map[string]map[string]ContainerCPUs, len(mem.baselines))
+			for pod, podBaselines := range mem.baselines {
+				b := make(map[string]ContainerCPUs, len(podBaselines))
+				for container, cpuAllocation := range podBaselines {
+					b[container] = ContainerCPUs{Baseline: cpuAllocation.Baseline.String()}
+				}
+				baselines[pod] = b
+			}
+		}
+		var podEntries PodCPUAssignments
+		if utilfeature.DefaultFeatureGate.Enabled(features.PodLevelResourceManagers) && len(mem.podAssignments) > 0 {
+			podEntries = make(PodCPUAssignments, len(mem.podAssignments))
+			maps.Copy(podEntries, mem.podAssignments)
+		}
+		defaultCPUSetStr := mem.defaultCPUSet.String()
+		mem.RUnlock()
+
+		checkpoint := &CPUManagerCheckpoint{
+			CheckpointData: CPUManagerCheckpointData{
+				PolicyName:    sc.policyName,
+				DefaultCPUSet: defaultCPUSetStr,
+				Entries:       entries,
+				PodEntries:    podEntries,
+				Baselines:     baselines,
+			},
+		}
+		err := sc.checkpointManager.CreateCheckpoint(sc.checkpointName, checkpoint)
+		if err != nil {
+			sc.logger.Error(err, "Failed to save checkpoint")
+			return err
+		}
+		return nil
+	}
+
 	checkpoint := newCPUManagerCheckpoint()
 	checkpoint.CheckpointData.PolicyName = sc.policyName
 	checkpoint.CheckpointData.DefaultCPUSet = sc.cache.GetDefaultCPUSet().String()
@@ -302,6 +349,111 @@ func (sc *stateCheckpoint) storeState() error {
 		return err
 	}
 	return nil
+}
+
+func (sc *stateCheckpoint) GetCPUSetView(podUID string, containerName string) (cpuset.CPUSet, bool) {
+	sc.mux.RLock()
+	defer sc.mux.RUnlock()
+	if fr, ok := sc.cache.(FastReader); ok {
+		return fr.GetCPUSetView(podUID, containerName)
+	}
+	return sc.cache.GetCPUSet(podUID, containerName)
+}
+
+func (sc *stateCheckpoint) GetDefaultCPUSetView() cpuset.CPUSet {
+	sc.mux.RLock()
+	defer sc.mux.RUnlock()
+	if fr, ok := sc.cache.(FastReader); ok {
+		return fr.GetDefaultCPUSetView()
+	}
+	return sc.cache.GetDefaultCPUSet()
+}
+
+func (sc *stateCheckpoint) GetCPUSetOrDefaultView(podUID string, containerName string) cpuset.CPUSet {
+	sc.mux.RLock()
+	defer sc.mux.RUnlock()
+	if fr, ok := sc.cache.(FastReader); ok {
+		return fr.GetCPUSetOrDefaultView(podUID, containerName)
+	}
+	return sc.cache.GetCPUSetOrDefault(podUID, containerName)
+}
+
+func (sc *stateCheckpoint) GetPodCPUSetView(podUID string) (cpuset.CPUSet, bool) {
+	sc.mux.RLock()
+	defer sc.mux.RUnlock()
+	if fr, ok := sc.cache.(FastReader); ok {
+		return fr.GetPodCPUSetView(podUID)
+	}
+	return sc.cache.GetPodCPUSet(podUID)
+}
+
+func (sc *stateCheckpoint) GetBaselineCPUSetView(podUID string, containerName string) (cpuset.CPUSet, bool) {
+	sc.mux.RLock()
+	defer sc.mux.RUnlock()
+	if fr, ok := sc.cache.(FastReader); ok {
+		return fr.GetBaselineCPUSetView(podUID, containerName)
+	}
+	return sc.cache.GetBaselineCPUSet(podUID, containerName)
+}
+
+func (sc *stateCheckpoint) ForEachCPUAssignment(fn func(podUID, containerName string, cset cpuset.CPUSet)) {
+	sc.mux.RLock()
+	defer sc.mux.RUnlock()
+	if fr, ok := sc.cache.(FastReader); ok {
+		fr.ForEachCPUAssignment(fn)
+		return
+	}
+	for podUID, containers := range sc.cache.GetCPUAssignments() {
+		for containerName, cset := range containers {
+			fn(podUID, containerName, cset)
+		}
+	}
+}
+
+func (sc *stateCheckpoint) GetPodCPUAssignmentCount(podUID string) int {
+	sc.mux.RLock()
+	defer sc.mux.RUnlock()
+	if fr, ok := sc.cache.(FastReader); ok {
+		return fr.GetPodCPUAssignmentCount(podUID)
+	}
+	return len(sc.cache.GetCPUAssignments()[podUID])
+}
+
+func (sc *stateCheckpoint) GetAssignedCPUsOfSiblings(podUID string, containerName string) cpuset.CPUSet {
+	sc.mux.RLock()
+	defer sc.mux.RUnlock()
+	if fr, ok := sc.cache.(FastReader); ok {
+		return fr.GetAssignedCPUsOfSiblings(podUID, containerName)
+	}
+	assignments := sc.cache.GetCPUAssignments()
+	cset := cpuset.New()
+	for name, cpus := range assignments[podUID] {
+		if containerName == name {
+			continue
+		}
+		cset = cset.Union(cpus)
+	}
+	return cset
+}
+
+func (sc *stateCheckpoint) GetTotalAssignedExclusiveCPUs(includePodLevel bool) cpuset.CPUSet {
+	sc.mux.RLock()
+	defer sc.mux.RUnlock()
+	if fr, ok := sc.cache.(FastReader); ok {
+		return fr.GetTotalAssignedExclusiveCPUs(includePodLevel)
+	}
+	totalAssignedCPUs := cpuset.New()
+	for _, assignment := range sc.cache.GetCPUAssignments() {
+		for _, cset := range assignment {
+			totalAssignedCPUs = totalAssignedCPUs.Union(cset)
+		}
+	}
+	if includePodLevel {
+		for _, podEntry := range sc.cache.GetPodCPUAssignments() {
+			totalAssignedCPUs = totalAssignedCPUs.Union(podEntry.CPUSet)
+		}
+	}
+	return totalAssignedCPUs
 }
 
 // GetCPUSet returns current CPU set

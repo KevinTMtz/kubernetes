@@ -496,7 +496,7 @@ func (m *managerImpl) reclaimNodeLevelResources(ctx context.Context, signalToRec
 		}
 
 		// make observations and get a function to derive pod usage stats relative to those observations.
-		observations, _ := makeSignalObservations(logger, summary)
+		observations := makeSignalObservationsWithoutStatsFunc(logger, summary)
 		debugLogObservations(logger, "observations after resource reclaim", observations)
 
 		// evaluate all thresholds independently of their grace period to see if with
@@ -540,27 +540,37 @@ func (m *managerImpl) localStorageEviction(logger klog.Logger, pods []*v1.Pod, s
 }
 
 func (m *managerImpl) emptyDirLimitEviction(logger klog.Logger, podStats statsapi.PodStats, pod *v1.Pod) bool {
-	podVolumeUsed := make(map[string]*resource.Quantity)
-	for _, volume := range podStats.VolumeStats {
-		podVolumeUsed[volume.Name] = resource.NewQuantity(int64(*volume.UsedBytes), resource.BinarySI)
+	if len(pod.Spec.Volumes) == 0 || len(podStats.VolumeStats) == 0 {
+		return false
 	}
 	for i := range pod.Spec.Volumes {
 		source := &pod.Spec.Volumes[i].VolumeSource
 		if source.EmptyDir != nil {
-			if utilfeature.DefaultFeatureGate.Enabled(features.InPlacePodVerticalScalingMemoryBackedVolumes) && source.EmptyDir.Medium == v1.StorageMediumMemory {
+			if source.EmptyDir.Medium == v1.StorageMediumMemory && utilfeature.DefaultFeatureGate.Enabled(features.InPlacePodVerticalScalingMemoryBackedVolumes) {
 				// Memory-backed emptyDir volumes are backed by tmpfs, which has its size limit
 				// enforced by the kernel. Eviction manager enforcement is not needed.
 				continue
 			}
 			size := source.EmptyDir.SizeLimit
-			used := podVolumeUsed[pod.Spec.Volumes[i].Name]
-			if used != nil && size != nil && size.Sign() == 1 && used.Cmp(*size) > 0 {
-				// the emptyDir usage exceeds the size limit, evict the pod
-				if m.evictPod(logger, pod, immediateEvictionGracePeriodSeconds, fmt.Sprintf(emptyDirMessageFmt, pod.Spec.Volumes[i].Name, size.String()), nil, nil) {
-					metrics.Evictions.WithLabelValues(signalEmptyDirFsLimit).Inc()
-					return true
+			if size == nil || size.Sign() != 1 {
+				continue
+			}
+			volName := pod.Spec.Volumes[i].Name
+			for j := len(podStats.VolumeStats) - 1; j >= 0; j-- {
+				if podStats.VolumeStats[j].Name == volName {
+					if podStats.VolumeStats[j].UsedBytes != nil {
+						used := *resource.NewQuantity(int64(*podStats.VolumeStats[j].UsedBytes), resource.BinarySI)
+						if used.Cmp(*size) > 0 {
+							// the emptyDir usage exceeds the size limit, evict the pod
+							if m.evictPod(logger, pod, immediateEvictionGracePeriodSeconds, fmt.Sprintf(emptyDirMessageFmt, volName, size.String()), nil, nil) {
+								metrics.Evictions.WithLabelValues(signalEmptyDirFsLimit).Inc()
+								return true
+							}
+							return false
+						}
+					}
+					break
 				}
-				return false
 			}
 		}
 	}
@@ -568,19 +578,98 @@ func (m *managerImpl) emptyDirLimitEviction(logger klog.Logger, podStats statsap
 	return false
 }
 
+func getPodEphemeralStorageLimit(pod *v1.Pod) (resource.Quantity, bool) {
+	if pod == nil {
+		return resource.Quantity{}, false
+	}
+	if pod.Spec.Resources != nil && resourcehelper.IsPodLevelResourcesSet(pod) && resourcehelper.IsSupportedPodLevelResource(v1.ResourceEphemeralStorage) {
+		if qty, ok := pod.Spec.Resources.Limits[v1.ResourceEphemeralStorage]; ok {
+			total := qty.DeepCopy()
+			if !total.IsZero() && len(pod.Spec.Overhead) > 0 {
+				if ov, hasOv := pod.Spec.Overhead[v1.ResourceEphemeralStorage]; hasOv {
+					total.Add(ov)
+				}
+			}
+			return total, true
+		}
+	}
+
+	var total resource.Quantity
+	var found bool
+	for i := range pod.Spec.Containers {
+		if qty, ok := pod.Spec.Containers[i].Resources.Limits[v1.ResourceEphemeralStorage]; ok {
+			if !found {
+				total = qty.DeepCopy()
+				found = true
+			} else {
+				total.Add(qty)
+			}
+		}
+	}
+
+	if len(pod.Spec.InitContainers) > 0 {
+		var restartableTotal resource.Quantity
+		var restartableFound bool
+		var initMax resource.Quantity
+		var initFound bool
+		for i := range pod.Spec.InitContainers {
+			c := &pod.Spec.InitContainers[i]
+			qty, hasQty := c.Resources.Limits[v1.ResourceEphemeralStorage]
+			if podutil.IsRestartableInitContainer(c) {
+				if hasQty {
+					if !found {
+						total = qty.DeepCopy()
+						found = true
+					} else {
+						total.Add(qty)
+					}
+					if !restartableFound {
+						restartableTotal = qty.DeepCopy()
+						restartableFound = true
+					} else {
+						restartableTotal.Add(qty)
+					}
+					if !initFound || restartableTotal.Cmp(initMax) > 0 {
+						initMax = restartableTotal.DeepCopy()
+						initFound = true
+					}
+				}
+			} else if hasQty {
+				combined := qty.DeepCopy()
+				if restartableFound {
+					combined.Add(restartableTotal)
+				}
+				if !initFound || combined.Cmp(initMax) > 0 {
+					initMax = combined
+					initFound = true
+				}
+			}
+		}
+		if initFound && (!found || initMax.Cmp(total) > 0) {
+			total = initMax
+			found = true
+		}
+	}
+
+	if found && !total.IsZero() && len(pod.Spec.Overhead) > 0 {
+		if ov, ok := pod.Spec.Overhead[v1.ResourceEphemeralStorage]; ok {
+			total.Add(ov)
+		}
+	}
+	return total, found
+}
+
 func (m *managerImpl) podEphemeralStorageLimitEviction(logger klog.Logger, podStats statsapi.PodStats, pod *v1.Pod) bool {
-	podLimits := resourcehelper.PodLimits(pod, resourcehelper.PodResourcesOptions{})
-	_, found := podLimits[v1.ResourceEphemeralStorage]
+	podEphemeralStorageLimit, found := getPodEphemeralStorageLimit(pod)
 	if !found {
 		return false
 	}
 
 	// pod stats api summarizes ephemeral storage usage (container, emptyDir, host[etc-hosts, logs])
-	podEphemeralStorageTotalUsage := &resource.Quantity{}
+	var podEphemeralStorageTotalUsage resource.Quantity
 	if podStats.EphemeralStorage != nil && podStats.EphemeralStorage.UsedBytes != nil {
-		podEphemeralStorageTotalUsage = resource.NewQuantity(int64(*podStats.EphemeralStorage.UsedBytes), resource.BinarySI)
+		podEphemeralStorageTotalUsage = *resource.NewQuantity(int64(*podStats.EphemeralStorage.UsedBytes), resource.BinarySI)
 	}
-	podEphemeralStorageLimit := podLimits[v1.ResourceEphemeralStorage]
 	if podEphemeralStorageTotalUsage.Cmp(podEphemeralStorageLimit) > 0 {
 		// the total usage of pod exceeds the total size limit of containers, evict the pod
 		message := fmt.Sprintf(podEphemeralStorageMessageFmt, podEphemeralStorageLimit.String())
@@ -593,36 +682,71 @@ func (m *managerImpl) podEphemeralStorageLimitEviction(logger klog.Logger, podSt
 	return false
 }
 
+func getContainerEphemeralStorageLimit(pod *v1.Pod, containerName string) (resource.Quantity, bool) {
+	var matched resource.Quantity
+	var found bool
+	for i := range pod.Spec.Containers {
+		c := &pod.Spec.Containers[i]
+		if c.Name == containerName {
+			// Use IsZero rather than Value to test whether a limit is set. Value can
+			// overflow an int64 and returns 0 when it does, so a large but valid limit
+			// such as "100E" would otherwise be mistaken for an unset limit and never
+			// enforced. The comparison below uses Cmp, which is overflow-safe.
+			if limit, ok := c.Resources.Limits[v1.ResourceEphemeralStorage]; ok && !limit.IsZero() {
+				matched = limit
+				found = true
+			}
+		}
+	}
+	for i := range pod.Spec.InitContainers {
+		c := &pod.Spec.InitContainers[i]
+		if c.Name == containerName && podutil.IsRestartableInitContainer(c) {
+			if limit, ok := c.Resources.Limits[v1.ResourceEphemeralStorage]; ok && !limit.IsZero() {
+				matched = limit
+				found = true
+			}
+		}
+	}
+	return matched, found
+}
+
 func (m *managerImpl) containerEphemeralStorageLimitEviction(logger klog.Logger, podStats statsapi.PodStats, pod *v1.Pod) bool {
-	thresholdsMap := make(map[string]*resource.Quantity)
-	for _, container := range pod.Spec.Containers {
-		ephemeralLimit := container.Resources.Limits.StorageEphemeral()
-		// Use IsZero rather than Value to test whether a limit is set. Value can
-		// overflow an int64 and returns 0 when it does, so a large but valid limit
-		// such as "100E" would otherwise be mistaken for an unset limit and never
-		// enforced. The comparison below uses Cmp, which is overflow-safe.
-		if ephemeralLimit != nil && !ephemeralLimit.IsZero() {
-			thresholdsMap[container.Name] = ephemeralLimit
+	if len(podStats.Containers) == 0 {
+		return false
+	}
+	hasAnyContainerLimit := false
+	for i := range pod.Spec.Containers {
+		if limit, ok := pod.Spec.Containers[i].Resources.Limits[v1.ResourceEphemeralStorage]; ok && !limit.IsZero() {
+			hasAnyContainerLimit = true
+			break
 		}
 	}
-	for _, container := range pod.Spec.InitContainers {
-		if !podutil.IsRestartableInitContainer(&container) {
-			continue
-		}
-		ephemeralLimit := container.Resources.Limits.StorageEphemeral()
-		if ephemeralLimit != nil && !ephemeralLimit.IsZero() {
-			thresholdsMap[container.Name] = ephemeralLimit
+	if !hasAnyContainerLimit {
+		for i := range pod.Spec.InitContainers {
+			c := &pod.Spec.InitContainers[i]
+			if podutil.IsRestartableInitContainer(c) {
+				if limit, ok := c.Resources.Limits[v1.ResourceEphemeralStorage]; ok && !limit.IsZero() {
+					hasAnyContainerLimit = true
+					break
+				}
+			}
 		}
 	}
+	if !hasAnyContainerLimit {
+		return false
+	}
 
-	for _, containerStat := range podStats.Containers {
-		containerUsed := diskUsage(containerStat.Logs)
-		if !*m.dedicatedImageFs {
-			containerUsed.Add(*diskUsage(containerStat.Rootfs))
-		}
-
-		if ephemeralStorageThreshold, ok := thresholdsMap[containerStat.Name]; ok {
-			if ephemeralStorageThreshold.Cmp(*containerUsed) < 0 {
+	for i := range podStats.Containers {
+		containerStat := &podStats.Containers[i]
+		if ephemeralStorageThreshold, ok := getContainerEphemeralStorageLimit(pod, containerStat.Name); ok {
+			containerUsed := resource.Quantity{Format: resource.BinarySI}
+			if containerStat.Logs != nil && containerStat.Logs.UsedBytes != nil {
+				containerUsed.Add(*resource.NewQuantity(int64(*containerStat.Logs.UsedBytes), resource.BinarySI))
+			}
+			if !*m.dedicatedImageFs && containerStat.Rootfs != nil && containerStat.Rootfs.UsedBytes != nil {
+				containerUsed.Add(*resource.NewQuantity(int64(*containerStat.Rootfs.UsedBytes), resource.BinarySI))
+			}
+			if ephemeralStorageThreshold.Cmp(containerUsed) < 0 {
 				if m.evictPod(logger, pod, immediateEvictionGracePeriodSeconds, fmt.Sprintf(containerEphemeralStorageMessageFmt, containerStat.Name, ephemeralStorageThreshold.String()), nil, nil) {
 					metrics.Evictions.WithLabelValues(signalEphemeralContainerFsLimit).Inc()
 					return true

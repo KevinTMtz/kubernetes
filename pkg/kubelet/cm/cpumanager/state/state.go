@@ -173,3 +173,18 @@ type State interface {
 	Reader
 	writer
 }
+
+// FastReader is an optional read-only extension interface implemented by built-in
+// State implementations to avoid cloning immutable CPUSet values or assignment maps
+// on hot reconciliation and staleness-check paths.
+type FastReader interface {
+	GetCPUSetView(podUID string, containerName string) (cpuset.CPUSet, bool)
+	GetDefaultCPUSetView() cpuset.CPUSet
+	GetCPUSetOrDefaultView(podUID string, containerName string) cpuset.CPUSet
+	GetPodCPUSetView(podUID string) (cpuset.CPUSet, bool)
+	GetBaselineCPUSetView(podUID string, containerName string) (cpuset.CPUSet, bool)
+	ForEachCPUAssignment(fn func(podUID, containerName string, cset cpuset.CPUSet))
+	GetPodCPUAssignmentCount(podUID string) int
+	GetAssignedCPUsOfSiblings(podUID string, containerName string) cpuset.CPUSet
+	GetTotalAssignedExclusiveCPUs(includePodLevel bool) cpuset.CPUSet
+}

@@ -36,6 +36,7 @@ type stateMemory struct {
 }
 
 var _ State = &stateMemory{}
+var _ FastReader = &stateMemory{}
 
 // NewMemoryState creates new State for keeping track of cpu/pod assignment
 func NewMemoryState(logger klog.Logger) State {
@@ -56,8 +57,16 @@ func (s *stateMemory) GetBaselineCPUSet(podUID string, containerName string) (cp
 	s.RLock()
 	defer s.RUnlock()
 
+	res, ok := s.baselines[podUID][containerName]
+	return res.Baseline.Clone(), ok
+}
+
+func (s *stateMemory) GetBaselineCPUSetView(podUID string, containerName string) (cpuset.CPUSet, bool) {
+	s.RLock()
+	defer s.RUnlock()
+
 	entry, exists := s.baselines[podUID][containerName]
-	return entry.Baseline.Clone(), exists
+	return entry.Baseline, exists
 }
 
 func (s *stateMemory) GetCPUSet(podUID string, containerName string) (cpuset.CPUSet, bool) {
@@ -68,6 +77,14 @@ func (s *stateMemory) GetCPUSet(podUID string, containerName string) (cpuset.CPU
 	return res.Clone(), ok
 }
 
+func (s *stateMemory) GetCPUSetView(podUID string, containerName string) (cpuset.CPUSet, bool) {
+	s.RLock()
+	defer s.RUnlock()
+
+	res, ok := s.assignments[podUID][containerName]
+	return res, ok
+}
+
 func (s *stateMemory) GetDefaultCPUSet() cpuset.CPUSet {
 	s.RLock()
 	defer s.RUnlock()
@@ -75,17 +92,83 @@ func (s *stateMemory) GetDefaultCPUSet() cpuset.CPUSet {
 	return s.defaultCPUSet.Clone()
 }
 
+func (s *stateMemory) GetDefaultCPUSetView() cpuset.CPUSet {
+	s.RLock()
+	defer s.RUnlock()
+
+	return s.defaultCPUSet
+}
+
 func (s *stateMemory) GetCPUSetOrDefault(podUID string, containerName string) cpuset.CPUSet {
-	if res, ok := s.GetCPUSet(podUID, containerName); ok {
+	s.RLock()
+	defer s.RUnlock()
+
+	if res, ok := s.assignments[podUID][containerName]; ok {
+		return res.Clone()
+	}
+	return s.defaultCPUSet.Clone()
+}
+
+func (s *stateMemory) GetCPUSetOrDefaultView(podUID string, containerName string) cpuset.CPUSet {
+	s.RLock()
+	defer s.RUnlock()
+
+	if res, ok := s.assignments[podUID][containerName]; ok {
 		return res
 	}
-	return s.GetDefaultCPUSet()
+	return s.defaultCPUSet
 }
 
 func (s *stateMemory) GetCPUAssignments() ContainerCPUAssignments {
 	s.RLock()
 	defer s.RUnlock()
 	return s.assignments.Clone()
+}
+
+func (s *stateMemory) ForEachCPUAssignment(fn func(podUID, containerName string, cset cpuset.CPUSet)) {
+	s.RLock()
+	defer s.RUnlock()
+	for podUID, containers := range s.assignments {
+		for containerName, cset := range containers {
+			fn(podUID, containerName, cset)
+		}
+	}
+}
+
+func (s *stateMemory) GetPodCPUAssignmentCount(podUID string) int {
+	s.RLock()
+	defer s.RUnlock()
+	return len(s.assignments[podUID])
+}
+
+func (s *stateMemory) GetAssignedCPUsOfSiblings(podUID string, containerName string) cpuset.CPUSet {
+	s.RLock()
+	defer s.RUnlock()
+	cset := cpuset.New()
+	for name, cpus := range s.assignments[podUID] {
+		if containerName == name {
+			continue
+		}
+		cset = cset.Union(cpus)
+	}
+	return cset
+}
+
+func (s *stateMemory) GetTotalAssignedExclusiveCPUs(includePodLevel bool) cpuset.CPUSet {
+	s.RLock()
+	defer s.RUnlock()
+	totalAssignedCPUs := cpuset.New()
+	for _, assignment := range s.assignments {
+		for _, cset := range assignment {
+			totalAssignedCPUs = totalAssignedCPUs.Union(cset)
+		}
+	}
+	if includePodLevel {
+		for _, podEntry := range s.podAssignments {
+			totalAssignedCPUs = totalAssignedCPUs.Union(podEntry.CPUSet)
+		}
+	}
+	return totalAssignedCPUs
 }
 
 func (s *stateMemory) GetPodCPUSet(podUID string) (cpuset.CPUSet, bool) {
@@ -95,10 +178,17 @@ func (s *stateMemory) GetPodCPUSet(podUID string) (cpuset.CPUSet, bool) {
 	return res.CPUSet.Clone(), ok
 }
 
+func (s *stateMemory) GetPodCPUSetView(podUID string) (cpuset.CPUSet, bool) {
+	s.RLock()
+	defer s.RUnlock()
+	res, ok := s.podAssignments[podUID]
+	return res.CPUSet, ok
+}
+
 func (s *stateMemory) GetPodCPUAssignments() PodCPUAssignments {
 	s.RLock()
 	defer s.RUnlock()
-	clone := make(PodCPUAssignments)
+	clone := make(PodCPUAssignments, len(s.podAssignments))
 	maps.Copy(clone, s.podAssignments)
 	return clone
 }
@@ -164,7 +254,7 @@ func (s *stateMemory) SetPodCPUAssignments(a PodCPUAssignments) {
 	s.Lock()
 	defer s.Unlock()
 
-	s.podAssignments = make(PodCPUAssignments)
+	s.podAssignments = make(PodCPUAssignments, len(a))
 	maps.Copy(s.podAssignments, a)
 	s.logger.Info("Updated pod CPUSet assignments", "assignments", a)
 }
